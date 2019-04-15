@@ -420,6 +420,8 @@ struct mac_device_info *dwmac1000_setup(void __iomem *ioaddr, int mcbins,
 {
 	struct mac_device_info *mac;
 	u32 hwid = readl(ioaddr + GMAC_VERSION);
+	
+	printk("%p, %x\n", ioaddr + GMAC_VERSION, hwid);
 
 	mac = kzalloc(sizeof(const struct mac_device_info), GFP_KERNEL);
 	if (!mac)

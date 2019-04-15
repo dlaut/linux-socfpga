@@ -36,6 +36,8 @@ static int dwmac1000_dma_init(void __iomem *ioaddr, int pbl, int fb, int mb,
 	u32 value = readl(ioaddr + DMA_BUS_MODE);
 	int limit;
 
+	printk("%p, %x\n", ioaddr + DMA_BUS_MODE, value);
+	
 	/* DMA SW reset */
 	value |= DMA_BUS_MODE_SFT_RESET;
 	writel(value, ioaddr + DMA_BUS_MODE);

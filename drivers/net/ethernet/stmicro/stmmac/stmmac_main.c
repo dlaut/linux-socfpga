@@ -52,6 +52,7 @@
 #include "stmmac_ptp.h"
 #include "stmmac.h"
 #include <linux/reset.h>
+#include <linux/of_mdio.h>
 
 #define STMMAC_ALIGN(x)	L1_CACHE_ALIGN(x)
 
@@ -164,6 +165,7 @@ static void stmmac_clk_csr_set(struct stmmac_priv *priv)
 {
 	u32 clk_rate;
 
+	printk("%s\n", __func__);
 	clk_rate = clk_get_rate(priv->stmmac_clk);
 
 	/* Platform provided default clk_csr would be assumed valid
@@ -796,6 +798,11 @@ static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
 	}
 }
 
+
+static void bogus_adjust_link(struct net_device *dev)
+{
+}
+
 /**
  * stmmac_init_phy - PHY initialization
  * @dev: net device structure
@@ -808,6 +815,7 @@ static int stmmac_init_phy(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 	struct phy_device *phydev;
+	struct device_node *phynode;
 	char phy_id_fmt[MII_BUS_ID_SIZE + 3];
 	char bus_id[MII_BUS_ID_SIZE];
 	int interface = priv->plat->interface;
@@ -816,18 +824,29 @@ static int stmmac_init_phy(struct net_device *dev)
 	priv->speed = 0;
 	priv->oldduplex = -1;
 
-	if (priv->plat->phy_bus_name)
-		snprintf(bus_id, MII_BUS_ID_SIZE, "%s-%x",
-			 priv->plat->phy_bus_name, priv->plat->bus_id);
-	else
-		snprintf(bus_id, MII_BUS_ID_SIZE, "stmmac-%x",
-			 priv->plat->bus_id);
+	// handle the fixed case first. device have already been registered in stmmac_mdio_register
+	if (of_phy_is_fixed_link(priv->device->of_node)) {
+		phynode = of_node_get(priv->device->of_node);
 
-	snprintf(phy_id_fmt, MII_BUS_ID_SIZE + 3, PHY_ID_FMT, bus_id,
-		 priv->plat->phy_addr);
-	pr_debug("stmmac_init_phy:  trying to attach to %s\n", phy_id_fmt);
+		netdev_dbg(dev, "fixed-link detected\n");
+		phydev = of_phy_connect(dev, phynode,
+					&bogus_adjust_link,
+					0, PHY_INTERFACE_MODE_NA);		
+	} else {
+	
+		if (priv->plat->phy_bus_name)
+			snprintf(bus_id, MII_BUS_ID_SIZE, "%s-%x",
+				 priv->plat->phy_bus_name, priv->plat->bus_id);
+		else
+			snprintf(bus_id, MII_BUS_ID_SIZE, "stmmac-%x",
+				 priv->plat->bus_id);
 
-	phydev = phy_connect(dev, phy_id_fmt, &stmmac_adjust_link, interface);
+		snprintf(phy_id_fmt, MII_BUS_ID_SIZE + 3, PHY_ID_FMT, bus_id,
+			 priv->plat->phy_addr);
+		pr_debug("stmmac_init_phy:  trying to attach to %s\n", phy_id_fmt);
+
+		phydev = phy_connect(dev, phy_id_fmt, &stmmac_adjust_link, interface);
+	}
 
 	if (IS_ERR_OR_NULL(phydev)) {
 		pr_err("%s: Could not attach to PHY\n", dev->name);
@@ -851,10 +870,11 @@ static int stmmac_init_phy(struct net_device *dev)
 	 * device as well.
 	 * Note: phydev->phy_id is the result of reading the UID PHY registers.
 	 */
-	if (phydev->phy_id == 0) {
+	/*if (phydev->phy_id == 0) {
 		phy_disconnect(phydev);
 		return -ENODEV;
-	}
+	}*/
+	
 	pr_debug("stmmac_init_phy:  %s: attached to PHY (UID 0x%x)"
 		 " Link = %d\n", dev->name, phydev->phy_id, phydev->link);
 
@@ -1701,7 +1721,7 @@ static int stmmac_hw_setup(struct net_device *dev, bool init_ptp)
 	/* DMA initialization and SW reset */
 	ret = stmmac_init_dma_engine(priv);
 	if (ret < 0) {
-		pr_err("%s: DMA engine initialization failed\n", __func__);
+		pr_err("%s: DMA engine initialization failed (%d)\n", __func__, ret);
 		return ret;
 	}
 
@@ -1779,6 +1799,8 @@ static int stmmac_open(struct net_device *dev)
 	int ret;
 
 	stmmac_check_ether_addr(priv);
+	
+	//TODO
 
 	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
 	    priv->pcs != STMMAC_PCS_RTBI) {
@@ -2727,11 +2749,13 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 
 	/* Identify the MAC HW device */
 	if (priv->plat->has_gmac) {
+		printk("has gmac\n");
 		priv->dev->priv_flags |= IFF_UNICAST_FLT;
 		mac = dwmac1000_setup(priv->ioaddr,
 				      priv->plat->multicast_filter_bins,
 				      priv->plat->unicast_filter_entries);
 	} else {
+		printk("no gmac\n");
 		mac = dwmac100_setup(priv->ioaddr);
 	}
 	if (!mac)
@@ -2935,8 +2959,18 @@ struct stmmac_priv *stmmac_dvr_probe(struct device *device,
 		priv->clk_csr = priv->plat->clk_csr;
 
 	stmmac_check_pcs_mode(priv);
-
-	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
+	
+	// check for fixed phy
+	if (of_phy_is_fixed_link(priv->device->of_node)) {
+		int rc = of_phy_register_fixed_link(priv->device->of_node);
+		if (rc < 0) {
+			netdev_err(ndev, "cannot register fixed PHY\n");
+			goto error_mdio_register;
+		}
+		
+		// ok, good, fixed phy has been registered and can be used later!
+		printk ("Using fixed PHY\n");
+	} else if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
 	    priv->pcs != STMMAC_PCS_RTBI) {
 		/* MDIO bus Registration */
 		ret = stmmac_mdio_register(ndev);
@@ -3057,9 +3091,13 @@ int stmmac_resume(struct net_device *ndev)
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	unsigned long flags;
 
+	printk ("%\n", __func__);
+	
 	if (!netif_running(ndev))
 		return 0;
 
+	printk ("%\n", __func__);
+	
 	spin_lock_irqsave(&priv->lock, flags);
 
 	/* Power Down bit, into the PM register, is cleared
