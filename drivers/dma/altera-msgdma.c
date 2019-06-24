@@ -19,6 +19,11 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/of.h>          // to match device on DTB
+#include <linux/of_device.h>
+#include <linux/of_dma.h>
+#include <linux/of_irq.h>
+#include <asm/io.h>
 
 #include "dmaengine.h"
 
@@ -26,27 +31,16 @@
 #define MSGDMA_DESC_NUM			1024
 
 /**
- * struct msgdma_extended_desc - implements an extended descriptor
- * @read_addr_lo: data buffer source address low bits
- * @write_addr_lo: data buffer destination address low bits
+ * struct msgdma_reg_desc - implements a regular descriptor
+ * @read_addr: data buffer source address
+ * @write_addr: data buffer destination address
  * @len: the number of bytes to transfer per descriptor
- * @burst_seq_num: bit 31:24 write burst
- *		   bit 23:16 read burst
- *		   bit 15:00 sequence number
- * @stride: bit 31:16 write stride
- *	    bit 15:00 read stride
- * @read_addr_hi: data buffer source address high bits
- * @write_addr_hi: data buffer destination address high bits
  * @control: characteristics of the transfer
  */
-struct msgdma_extended_desc {
-	u32 read_addr_lo;
-	u32 write_addr_lo;
+struct msgdma_reg_desc {
+	u32 read_addr;
+	u32 write_addr;
 	u32 len;
-	u32 burst_seq_num;
-	u32 stride;
-	u32 read_addr_hi;
-	u32 write_addr_hi;
 	u32 control;
 };
 
@@ -150,14 +144,14 @@ struct msgdma_extended_desc {
 #define MSGDMA_RESP_ERR_MASK	0xff
 
 /**
- * struct msgdma_sw_desc - implements a sw descriptor
+ * struct msgdma_sw_desc - implements a regular sw descriptor
  * @async_tx: support for the async_tx api
  * @hw_desc: assosiated HW descriptor
  * @free_list: node of the free SW descriprots list
  */
 struct msgdma_sw_desc {
 	struct dma_async_tx_descriptor async_tx;
-	struct msgdma_extended_desc hw_desc;
+	struct msgdma_reg_desc hw_desc;
 	struct list_head node;
 	struct list_head tx_list;
 };
@@ -194,6 +188,7 @@ struct msgdma_device {
 
 	/* mSGDMA response */
 	void __iomem *resp;
+	int resp_enabled;
 };
 
 #define to_mdev(chan)	container_of(chan, struct msgdma_device, dmachan)
@@ -248,8 +243,21 @@ static void msgdma_free_desc_list(struct msgdma_device *mdev,
 {
 	struct msgdma_sw_desc *desc, *next;
 
-	list_for_each_entry_safe(desc, next, list, node)
+	list_for_each_entry_safe(desc, next, list, node) {
+		list_del(&desc->node);
 		msgdma_free_descriptor(mdev, desc);
+	}
+}
+
+/**
+ * msgdma_free_descriptors - Free channel descriptors
+ * @mdev: Pointer to the Altera mSGDMA device structure
+ */
+static void msgdma_free_descriptors(struct msgdma_device *mdev)
+{
+	msgdma_free_desc_list(mdev, &mdev->active_list);
+	msgdma_free_desc_list(mdev, &mdev->pending_list);
+	msgdma_free_desc_list(mdev, &mdev->done_list);
 }
 
 /**
@@ -259,37 +267,32 @@ static void msgdma_free_desc_list(struct msgdma_device *mdev,
  * @src: Source buffer address
  * @len: Transfer length
  */
-static void msgdma_desc_config(struct msgdma_extended_desc *desc,
+static void msgdma_desc_config(struct msgdma_reg_desc *desc,
 			       dma_addr_t dst, dma_addr_t src, size_t len,
 			       u32 stride)
 {
-	/* Set lower 32bits of src & dst addresses in the descriptor */
-	desc->read_addr_lo = lower_32_bits(src);
-	desc->write_addr_lo = lower_32_bits(dst);
-
-	/* Set upper 32bits of src & dst addresses in the descriptor */
-	desc->read_addr_hi = upper_32_bits(src);
-	desc->write_addr_hi = upper_32_bits(dst);
+	/* Set src & dst addresses in the descriptor */
+	desc->read_addr = src;
+	desc->write_addr = dst;
 
 	desc->len = len;
-	desc->stride = stride;
-	desc->burst_seq_num = 0;	/* 0 will result in max burst length */
 
 	/*
 	 * Don't set interrupt on xfer end yet, this will be done later
-	 * for the "last" descriptor
+	 * for the "last" descriptor.
+	 * EOP is enabled for every transfer, since it is required by
+	 * some scenarios and it shouldn't create problems to those not using it.
 	 */
-	desc->control = MSGDMA_DESC_CTL_TR_ERR_IRQ | MSGDMA_DESC_CTL_GO |
-		MSGDMA_DESC_CTL_END_ON_LEN;
+	desc->control = MSGDMA_DESC_CTL_GO | MSGDMA_DESC_CTL_END_ON_EOP;
 }
 
 /**
  * msgdma_desc_config_eod - Mark the descriptor as end descriptor
  * @desc: Hw descriptor pointer
  */
-static void msgdma_desc_config_eod(struct msgdma_extended_desc *desc)
+static void msgdma_desc_config_eod(struct msgdma_reg_desc *desc)
 {
-	desc->control |= MSGDMA_DESC_CTL_TR_COMP_IRQ;
+	desc->control |= (MSGDMA_DESC_CTL_TR_COMP_IRQ | MSGDMA_DESC_CTL_EARLY_IRQ);
 }
 
 /**
@@ -331,7 +334,7 @@ msgdma_prep_memcpy(struct dma_chan *dchan, dma_addr_t dma_dst,
 {
 	struct msgdma_device *mdev = to_mdev(dchan);
 	struct msgdma_sw_desc *new, *first = NULL;
-	struct msgdma_extended_desc *desc;
+	struct msgdma_reg_desc *desc;
 	size_t copy;
 	u32 desc_cnt;
 	unsigned long irqflags;
@@ -398,6 +401,8 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	u32 stride;
 	unsigned long irqflags;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	for_each_sg(sgl, sg, sg_len, i)
 		desc_cnt += DIV_ROUND_UP(sg_dma_len(sg), MSGDMA_MAX_TRANS_LEN);
 
@@ -429,6 +434,7 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 			dma_dst = sg_dma_address(sgl) + sg_dma_len(sgl) - avail;
 			stride = MSGDMA_DESC_STRIDE_WR;
 		}
+		dev_dbg(mdev->dev, "%s: new scatterlist %x %x\n", __FUNCTION__, dma_src, dma_dst);
 		msgdma_desc_config(desc, dma_dst, dma_src, len, stride);
 		avail -= len;
 
@@ -452,6 +458,8 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	msgdma_desc_config_eod(desc);
 	first->async_tx.flags = flags;
 
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 	return &first->async_tx;
 }
 
@@ -470,13 +478,15 @@ static void msgdma_reset(struct msgdma_device *mdev)
 	u32 val;
 	int ret;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	/* Reset mSGDMA */
 	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
 	iowrite32(MSGDMA_CSR_CTL_RESET, mdev->csr + MSGDMA_CSR_CONTROL);
 
-	ret = readl_poll_timeout(mdev->csr + MSGDMA_CSR_STATUS, val,
-				 (val & MSGDMA_CSR_STAT_RESETTING) == 0,
-				 1, 10000);
+	ret = readl_poll_timeout_atomic(mdev->csr + MSGDMA_CSR_STATUS, val,
+					(val & MSGDMA_CSR_STAT_RESETTING) == 0,
+					1, 10000);
 	if (ret)
 		dev_err(mdev->dev, "DMA channel did not reset\n");
 
@@ -484,16 +494,44 @@ static void msgdma_reset(struct msgdma_device *mdev)
 	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
 
 	/* Enable the DMA controller including interrupts */
-	iowrite32(MSGDMA_CSR_CTL_STOP_ON_ERR | MSGDMA_CSR_CTL_STOP_ON_EARLY |
-		  MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
+	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
 
 	mdev->idle = true;
-};
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+}
+
+/* NOTE: this is actually a reset function. Its purpose is to export a reset
+    API using dmaengine's 'device_terminate_all' API, which is the closest
+    to a reset API we found in the current APIs. */
+static int msgdma_terminate(struct dma_chan *dchan) {
+
+    struct msgdma_device *mdev = to_mdev(dchan);
+    unsigned long flags;
+
+    dev_dbg(mdev->dev, "%s: start", __FUNCTION__);
+
+    spin_lock_irqsave(&mdev->lock, flags);
+
+    /* Free all sw descriptors */
+    msgdma_free_descriptors(mdev);
+
+    /* HW reset of DMA */
+    msgdma_reset(mdev);
+
+    spin_unlock_irqrestore(&mdev->lock, flags);
+
+    dev_dbg(mdev->dev, "%s: end", __FUNCTION__);
+
+    return 0;
+}
 
 static void msgdma_copy_one(struct msgdma_device *mdev,
 			    struct msgdma_sw_desc *desc)
 {
 	void __iomem *hw_desc = mdev->desc;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	/*
 	 * Check if the DESC FIFO it not full. If its full, we need to wait
@@ -512,15 +550,33 @@ static void msgdma_copy_one(struct msgdma_device *mdev,
 	 * sure this control word is written last by single coding it and
 	 * adding some write-barriers here.
 	 */
-	memcpy((void __force *)hw_desc, &desc->hw_desc,
-	       sizeof(desc->hw_desc) - sizeof(u32));
+	//memcpy((void __force *)hw_desc, &desc->hw_desc, sizeof(desc->hw_desc) - sizeof(u32));
+
+	dev_dbg(mdev->dev, "%s: read_addr %x\n", __FUNCTION__, desc->hw_desc.read_addr);
+	iowrite32(desc->hw_desc.read_addr, hw_desc +
+		  offsetof(struct msgdma_reg_desc, read_addr));
+	wmb();
+
+	dev_dbg(mdev->dev, "%s: write_addr %x\n", __FUNCTION__, desc->hw_desc.write_addr);
+	iowrite32(desc->hw_desc.write_addr, hw_desc +
+		  offsetof(struct msgdma_reg_desc, write_addr));
+	wmb();
+
+	dev_dbg(mdev->dev, "%s: len %x\n", __FUNCTION__, desc->hw_desc.len);
+	iowrite32(desc->hw_desc.len, hw_desc +
+		  offsetof(struct msgdma_reg_desc, len));
+	wmb();
 
 	/* Write control word last to flush this descriptor into the FIFO */
 	mdev->idle = false;
 	wmb();
+	dev_dbg(mdev->dev, "%s: control %x\n", __FUNCTION__, desc->hw_desc.control);
 	iowrite32(desc->hw_desc.control, hw_desc +
-		  offsetof(struct msgdma_extended_desc, control));
+		  offsetof(struct msgdma_reg_desc, control));
 	wmb();
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 }
 
 /**
@@ -547,6 +603,8 @@ static void msgdma_start_transfer(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	if (!mdev->idle)
 		return;
 
@@ -557,6 +615,7 @@ static void msgdma_start_transfer(struct msgdma_device *mdev)
 
 	list_splice_tail_init(&mdev->pending_list, &mdev->active_list);
 	msgdma_copy_desc_to_fifo(mdev, desc);
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
 }
 
 /**
@@ -568,9 +627,14 @@ static void msgdma_issue_pending(struct dma_chan *chan)
 	struct msgdma_device *mdev = to_mdev(chan);
 	unsigned long flags;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	spin_lock_irqsave(&mdev->lock, flags);
 	msgdma_start_transfer(mdev);
 	spin_unlock_irqrestore(&mdev->lock, flags);
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 }
 
 /**
@@ -580,6 +644,8 @@ static void msgdma_issue_pending(struct dma_chan *chan)
 static void msgdma_chan_desc_cleanup(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc, *next;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	list_for_each_entry_safe(desc, next, &mdev->done_list, node) {
 		dma_async_tx_callback callback;
@@ -608,6 +674,8 @@ static void msgdma_complete_descriptor(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	desc = list_first_entry_or_null(&mdev->active_list,
 					struct msgdma_sw_desc, node);
 	if (!desc)
@@ -615,17 +683,6 @@ static void msgdma_complete_descriptor(struct msgdma_device *mdev)
 	list_del(&desc->node);
 	dma_cookie_complete(&desc->async_tx);
 	list_add_tail(&desc->node, &mdev->done_list);
-}
-
-/**
- * msgdma_free_descriptors - Free channel descriptors
- * @mdev: Pointer to the Altera mSGDMA device structure
- */
-static void msgdma_free_descriptors(struct msgdma_device *mdev)
-{
-	msgdma_free_desc_list(mdev, &mdev->active_list);
-	msgdma_free_desc_list(mdev, &mdev->pending_list);
-	msgdma_free_desc_list(mdev, &mdev->done_list);
 }
 
 /**
@@ -671,43 +728,59 @@ static int msgdma_alloc_chan_resources(struct dma_chan *dchan)
 		list_add_tail(&desc->node, &mdev->free_list);
 	}
 
+	/* Enable the DMA controller including interrupts  */
+	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
+
 	return MSGDMA_DESC_NUM;
 }
 
 /**
  * msgdma_tasklet - Schedule completion tasklet
- * @data: Pointer to the Altera sSGDMA channel structure
+ * @data: Pointer to the Altera mSGDMA channel structure
  */
 static void msgdma_tasklet(unsigned long data)
 {
 	struct msgdma_device *mdev = (struct msgdma_device *)data;
-	u32 count;
-	u32 __maybe_unused size;
-	u32 __maybe_unused status;
 	unsigned long flags;
+
+	dev_dbg(mdev->dev, "%s: start", __FUNCTION__);
 
 	spin_lock_irqsave(&mdev->lock, flags);
 
-	/* Read number of responses that are available */
-	count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
-	dev_dbg(mdev->dev, "%s (%d): response count=%d\n",
-		__func__, __LINE__, count);
+	/* ML: if we not support response register, we don't need that cycle */
+	if (mdev->resp) {
+		/* Read number of responses that are available */
+		u32 count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
 
-	while (count--) {
-		/*
-		 * Read both longwords to purge this response from the FIFO
-		 * On Avalon-MM implementations, size and status do not
-		 * have any real values, like transferred bytes or error
-		 * bits. So we need to just drop these values.
-		 */
-		size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
-		status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
+		dev_dbg(mdev->dev, "%s (%d): response count=%d",
+			__func__, __LINE__, count);
 
+		while (count--) {
+			/*
+			 * When dma is setup as a memory-mapped slave port, reading
+			 * byte offset 0x7 pops the response from the response FIFO.
+			 *
+			 * On Avalon-MM implementations, size and status do not
+			 * have any real values, like transferred bytes or error
+			 * bits. So we need to just drop these values.
+			 */
+			u32 size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
+			u32 status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
+
+			if (!(status & MSGDMA_RESP_EARLY_TERM)) {
+				msgdma_complete_descriptor(mdev);
+				msgdma_chan_desc_cleanup(mdev);
+			}
+		}
+	} else {
 		msgdma_complete_descriptor(mdev);
 		msgdma_chan_desc_cleanup(mdev);
 	}
 
 	spin_unlock_irqrestore(&mdev->lock, flags);
+
+	dev_dbg(mdev->dev, "%s: end", __FUNCTION__);
+
 }
 
 /**
@@ -782,6 +855,35 @@ static int request_and_map(struct platform_device *pdev, const char *name,
 	return 0;
 }
 
+static struct dma_chan *of_dma_altera_msgdma_xlate(struct of_phandle_args *dma_spec,
+						struct of_dma *ofdma)
+{
+	int count = dma_spec->args_count;
+	struct msgdma_device *msgdma = ofdma->of_dma_data;
+	struct dma_chan * r;
+
+	if (!msgdma) {
+		pr_err("!msgdma\n");
+		return NULL;
+	}
+
+	if (count != 1) {
+		pr_err("count != 1\n");
+		return NULL;
+	}
+
+	// ignore argument (no needed)
+	// chan_id = dma_spec->args[0];
+
+	r = dma_get_slave_channel(&msgdma->dmachan);
+	if (!r) {
+		pr_err("!r\n");
+		return NULL;
+	}
+
+	return r;
+}
+
 /**
  * msgdma_probe - Driver probe function
  * @pdev: Pointer to the platform_device structure
@@ -814,17 +916,18 @@ static int msgdma_probe(struct platform_device *pdev)
 	/* Map response space */
 	ret = request_and_map(pdev, "resp", &dma_res, &mdev->resp);
 	if (ret)
-		return ret;
+		mdev->resp_enabled = 0;
+	else
+		mdev->resp_enabled = 1;
 
 	platform_set_drvdata(pdev, mdev);
 
 	/* Get interrupt nr from platform data */
-	mdev->irq = platform_get_irq(pdev, 0);
+	mdev->irq = irq_of_parse_and_map(mdev->dev->of_node, 0);
 	if (mdev->irq < 0)
 		return -ENXIO;
 
-	ret = devm_request_irq(&pdev->dev, mdev->irq, msgdma_irq_handler,
-			       0, dev_name(&pdev->dev), mdev);
+	ret = request_irq(mdev->irq, msgdma_irq_handler, 0, dev_name(&pdev->dev), mdev);
 	if (ret)
 		return ret;
 
@@ -837,7 +940,7 @@ static int msgdma_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&mdev->active_list);
 	INIT_LIST_HEAD(&mdev->pending_list);
 	INIT_LIST_HEAD(&mdev->done_list);
-	INIT_LIST_HEAD(&mdev->free_list);
+	// INIT_LIST_HEAD(&mdev->free_list);
 
 	dma_dev = &mdev->dmadev;
 
@@ -867,6 +970,7 @@ static int msgdma_probe(struct platform_device *pdev)
 
 	dma_dev->device_alloc_chan_resources = msgdma_alloc_chan_resources;
 	dma_dev->device_free_chan_resources = msgdma_free_chan_resources;
+	dma_dev->device_terminate_all = msgdma_terminate;
 
 	mdev->dmachan.device = dma_dev;
 	list_add_tail(&mdev->dmachan.device_node, &dma_dev->channels);
@@ -885,6 +989,15 @@ static int msgdma_probe(struct platform_device *pdev)
 	ret = dma_async_device_register(dma_dev);
 	if (ret)
 		goto fail;
+
+	if (pdev->dev.of_node) {
+		ret = of_dma_controller_register(pdev->dev.of_node,
+					 of_dma_altera_msgdma_xlate, mdev);
+		if (ret) {
+			dev_err(&pdev->dev,
+			"unable to register DMA to the generic DT DMA helpers\n");
+		}
+	}
 
 	dev_notice(&pdev->dev, "Altera mSGDMA driver probe success\n");
 
@@ -914,9 +1027,18 @@ static int msgdma_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static struct of_device_id match[] =
+{
+	{.compatible="altera-msgdma", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, match);
+
 static struct platform_driver msgdma_driver = {
 	.driver = {
 		.name = "altera-msgdma",
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(match),
 	},
 	.probe = msgdma_probe,
 	.remove = msgdma_remove,
