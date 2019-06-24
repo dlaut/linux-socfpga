@@ -19,6 +19,8 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/of.h>          // to match device on DTB
+#include <linux/of_device.h>
 
 #include "dmaengine.h"
 
@@ -194,6 +196,7 @@ struct msgdma_device {
 
 	/* mSGDMA response */
 	void __iomem *resp;
+	int resp_enabled;
 };
 
 #define to_mdev(chan)	container_of(chan, struct msgdma_device, dmachan)
@@ -694,14 +697,16 @@ static void msgdma_tasklet(unsigned long data)
 		__func__, __LINE__, count);
 
 	while (count--) {
-		/*
-		 * Read both longwords to purge this response from the FIFO
-		 * On Avalon-MM implementations, size and status do not
-		 * have any real values, like transferred bytes or error
-		 * bits. So we need to just drop these values.
-		 */
-		size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
-		status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
+		if (mdev->resp) {
+			/*
+			* Read both longwords to purge this response from the FIFO
+			* On Avalon-MM implementations, size and status do not
+			* have any real values, like transferred bytes or error
+			* bits. So we need to just drop these values.
+			*/
+			size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
+			status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
+		}
 
 		msgdma_complete_descriptor(mdev);
 		msgdma_chan_desc_cleanup(mdev);
@@ -814,7 +819,9 @@ static int msgdma_probe(struct platform_device *pdev)
 	/* Map response space */
 	ret = request_and_map(pdev, "resp", &dma_res, &mdev->resp);
 	if (ret)
-		return ret;
+		mdev->resp_enabled = 0;
+	else
+		mdev->resp_enabled = 1;
 
 	platform_set_drvdata(pdev, mdev);
 
@@ -914,9 +921,18 @@ static int msgdma_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static struct of_device_id match[] =
+{
+	{.compatible="altera-msgdma", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, match);
+
 static struct platform_driver msgdma_driver = {
 	.driver = {
 		.name = "altera-msgdma",
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(match),
 	},
 	.probe = msgdma_probe,
 	.remove = msgdma_remove,
