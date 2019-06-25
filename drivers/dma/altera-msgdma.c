@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/of.h>          // to match device on DTB
 #include <linux/of_device.h>
+#include <linux/of_dma.h>
 
 #include "dmaengine.h"
 
@@ -787,6 +788,35 @@ static int request_and_map(struct platform_device *pdev, const char *name,
 	return 0;
 }
 
+static struct dma_chan *of_dma_altera_msgdma_xlate(struct of_phandle_args *dma_spec,
+						struct of_dma *ofdma)
+{
+	int count = dma_spec->args_count;
+	struct msgdma_device *msgdma = ofdma->of_dma_data;
+	struct dma_chan * r;
+
+	if (!msgdma) {
+		pr_err("!msgdma\n");
+		return NULL;
+	}
+
+	if (count != 1) {
+		pr_err("count != 1\n");
+		return NULL;
+	}
+
+	// ignore argument (no needed)
+	// chan_id = dma_spec->args[0];
+
+	r = dma_get_slave_channel(&msgdma->dmachan);
+	if (!r) {
+		pr_err("!r\n");
+		return NULL;
+	}
+
+	return r;
+}
+
 /**
  * msgdma_probe - Driver probe function
  * @pdev: Pointer to the platform_device structure
@@ -892,6 +922,15 @@ static int msgdma_probe(struct platform_device *pdev)
 	ret = dma_async_device_register(dma_dev);
 	if (ret)
 		goto fail;
+
+	if (pdev->dev.of_node) {
+		ret = of_dma_controller_register(pdev->dev.of_node,
+					 of_dma_altera_msgdma_xlate, mdev);
+		if (ret) {
+			dev_err(&pdev->dev,
+			"unable to register DMA to the generic DT DMA helpers\n");
+		}
+	}
 
 	dev_notice(&pdev->dev, "Altera mSGDMA driver probe success\n");
 
