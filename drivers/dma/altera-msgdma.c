@@ -29,27 +29,16 @@
 #define MSGDMA_DESC_NUM			1024
 
 /**
- * struct msgdma_extended_desc - implements an extended descriptor
- * @read_addr_lo: data buffer source address low bits
- * @write_addr_lo: data buffer destination address low bits
+ * struct msgdma_reg_desc - implements a regular descriptor
+ * @read_addr: data buffer source address
+ * @write_addr: data buffer destination address
  * @len: the number of bytes to transfer per descriptor
- * @burst_seq_num: bit 31:24 write burst
- *		   bit 23:16 read burst
- *		   bit 15:00 sequence number
- * @stride: bit 31:16 write stride
- *	    bit 15:00 read stride
- * @read_addr_hi: data buffer source address high bits
- * @write_addr_hi: data buffer destination address high bits
  * @control: characteristics of the transfer
  */
-struct msgdma_extended_desc {
-	u32 read_addr_lo;
-	u32 write_addr_lo;
+struct msgdma_reg_desc {
+	u32 read_addr;
+	u32 write_addr;
 	u32 len;
-	u32 burst_seq_num;
-	u32 stride;
-	u32 read_addr_hi;
-	u32 write_addr_hi;
 	u32 control;
 };
 
@@ -153,14 +142,14 @@ struct msgdma_extended_desc {
 #define MSGDMA_RESP_ERR_MASK	0xff
 
 /**
- * struct msgdma_sw_desc - implements a sw descriptor
+ * struct msgdma_sw_desc - implements a regular sw descriptor
  * @async_tx: support for the async_tx api
  * @hw_desc: assosiated HW descriptor
  * @free_list: node of the free SW descriprots list
  */
 struct msgdma_sw_desc {
 	struct dma_async_tx_descriptor async_tx;
-	struct msgdma_extended_desc hw_desc;
+	struct msgdma_reg_desc hw_desc;
 	struct list_head node;
 	struct list_head tx_list;
 };
@@ -263,21 +252,15 @@ static void msgdma_free_desc_list(struct msgdma_device *mdev,
  * @src: Source buffer address
  * @len: Transfer length
  */
-static void msgdma_desc_config(struct msgdma_extended_desc *desc,
+static void msgdma_desc_config(struct msgdma_reg_desc *desc,
 			       dma_addr_t dst, dma_addr_t src, size_t len,
 			       u32 stride)
 {
-	/* Set lower 32bits of src & dst addresses in the descriptor */
-	desc->read_addr_lo = lower_32_bits(src);
-	desc->write_addr_lo = lower_32_bits(dst);
-
-	/* Set upper 32bits of src & dst addresses in the descriptor */
-	desc->read_addr_hi = upper_32_bits(src);
-	desc->write_addr_hi = upper_32_bits(dst);
+	/* Set src & dst addresses in the descriptor */
+	desc->read_addr = src;
+	desc->write_addr = dst;
 
 	desc->len = len;
-	desc->stride = stride;
-	desc->burst_seq_num = 0;	/* 0 will result in max burst length */
 
 	/*
 	 * Don't set interrupt on xfer end yet, this will be done later
@@ -291,7 +274,7 @@ static void msgdma_desc_config(struct msgdma_extended_desc *desc,
  * msgdma_desc_config_eod - Mark the descriptor as end descriptor
  * @desc: Hw descriptor pointer
  */
-static void msgdma_desc_config_eod(struct msgdma_extended_desc *desc)
+static void msgdma_desc_config_eod(struct msgdma_reg_desc *desc)
 {
 	desc->control |= MSGDMA_DESC_CTL_TR_COMP_IRQ;
 }
@@ -335,7 +318,7 @@ msgdma_prep_memcpy(struct dma_chan *dchan, dma_addr_t dma_dst,
 {
 	struct msgdma_device *mdev = to_mdev(dchan);
 	struct msgdma_sw_desc *new, *first = NULL;
-	struct msgdma_extended_desc *desc;
+	struct msgdma_reg_desc *desc;
 	size_t copy;
 	u32 desc_cnt;
 	unsigned long irqflags;
@@ -523,7 +506,7 @@ static void msgdma_copy_one(struct msgdma_device *mdev,
 	mdev->idle = false;
 	wmb();
 	iowrite32(desc->hw_desc.control, hw_desc +
-		  offsetof(struct msgdma_extended_desc, control));
+		  offsetof(struct msgdma_reg_desc, control));
 	wmb();
 }
 
