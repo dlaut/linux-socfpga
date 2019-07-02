@@ -22,6 +22,7 @@
 #include <linux/of.h>          // to match device on DTB
 #include <linux/of_device.h>
 #include <linux/of_dma.h>
+#include <linux/of_irq.h>
 
 #include "dmaengine.h"
 
@@ -266,8 +267,7 @@ static void msgdma_desc_config(struct msgdma_reg_desc *desc,
 	 * Don't set interrupt on xfer end yet, this will be done later
 	 * for the "last" descriptor
 	 */
-	desc->control = MSGDMA_DESC_CTL_TR_ERR_IRQ | MSGDMA_DESC_CTL_GO |
-		MSGDMA_DESC_CTL_END_ON_LEN;
+	desc->control = MSGDMA_DESC_CTL_TR_ERR_IRQ | MSGDMA_DESC_CTL_GO | MSGDMA_DESC_CTL_EARLY_IRQ;
 }
 
 /**
@@ -385,6 +385,8 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	u32 stride;
 	unsigned long irqflags;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	for_each_sg(sgl, sg, sg_len, i)
 		desc_cnt += DIV_ROUND_UP(sg_dma_len(sg), MSGDMA_MAX_TRANS_LEN);
 
@@ -416,6 +418,7 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 			dma_dst = sg_dma_address(sgl) + sg_dma_len(sgl) - avail;
 			stride = MSGDMA_DESC_STRIDE_WR;
 		}
+		dev_dbg(mdev->dev, "%s: new scatterlist %x %x\n", __FUNCTION__, dma_src, dma_dst);
 		msgdma_desc_config(desc, dma_dst, dma_src, len, stride);
 		avail -= len;
 
@@ -439,6 +442,8 @@ msgdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	msgdma_desc_config_eod(desc);
 	first->async_tx.flags = flags;
 
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 	return &first->async_tx;
 }
 
@@ -456,6 +461,8 @@ static void msgdma_reset(struct msgdma_device *mdev)
 {
 	u32 val;
 	int ret;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	/* Reset mSGDMA */
 	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
@@ -475,12 +482,16 @@ static void msgdma_reset(struct msgdma_device *mdev)
 		  MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
 
 	mdev->idle = true;
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
 };
 
 static void msgdma_copy_one(struct msgdma_device *mdev,
 			    struct msgdma_sw_desc *desc)
 {
 	void __iomem *hw_desc = mdev->desc;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	/*
 	 * Check if the DESC FIFO it not full. If its full, we need to wait
@@ -508,6 +519,9 @@ static void msgdma_copy_one(struct msgdma_device *mdev,
 	iowrite32(desc->hw_desc.control, hw_desc +
 		  offsetof(struct msgdma_reg_desc, control));
 	wmb();
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 }
 
 /**
@@ -534,6 +548,8 @@ static void msgdma_start_transfer(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	if (!mdev->idle)
 		return;
 
@@ -544,6 +560,7 @@ static void msgdma_start_transfer(struct msgdma_device *mdev)
 
 	list_splice_tail_init(&mdev->pending_list, &mdev->active_list);
 	msgdma_copy_desc_to_fifo(mdev, desc);
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
 }
 
 /**
@@ -555,9 +572,14 @@ static void msgdma_issue_pending(struct dma_chan *chan)
 	struct msgdma_device *mdev = to_mdev(chan);
 	unsigned long flags;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	spin_lock_irqsave(&mdev->lock, flags);
 	msgdma_start_transfer(mdev);
 	spin_unlock_irqrestore(&mdev->lock, flags);
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 }
 
 /**
@@ -567,6 +589,8 @@ static void msgdma_issue_pending(struct dma_chan *chan)
 static void msgdma_chan_desc_cleanup(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc, *next;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	list_for_each_entry_safe(desc, next, &mdev->done_list, node) {
 		dma_async_tx_callback callback;
@@ -594,6 +618,8 @@ static void msgdma_chan_desc_cleanup(struct msgdma_device *mdev)
 static void msgdma_complete_descriptor(struct msgdma_device *mdev)
 {
 	struct msgdma_sw_desc *desc;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	desc = list_first_entry_or_null(&mdev->active_list,
 					struct msgdma_sw_desc, node);
@@ -673,6 +699,8 @@ static void msgdma_tasklet(unsigned long data)
 	u32 __maybe_unused status;
 	unsigned long flags;
 
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
 	spin_lock_irqsave(&mdev->lock, flags);
 
 	/* Read number of responses that are available */
@@ -697,6 +725,9 @@ static void msgdma_tasklet(unsigned long data)
 	}
 
 	spin_unlock_irqrestore(&mdev->lock, flags);
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
 }
 
 /**
@@ -839,12 +870,11 @@ static int msgdma_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, mdev);
 
 	/* Get interrupt nr from platform data */
-	mdev->irq = platform_get_irq(pdev, 0);
+	mdev->irq = irq_of_parse_and_map(mdev->dev->of_node, 0);
 	if (mdev->irq < 0)
 		return -ENXIO;
 
-	ret = devm_request_irq(&pdev->dev, mdev->irq, msgdma_irq_handler,
-			       0, dev_name(&pdev->dev), mdev);
+	ret = request_irq(mdev->irq, msgdma_irq_handler, 0, dev_name(&pdev->dev), mdev);
 	if (ret)
 		return ret;
 
