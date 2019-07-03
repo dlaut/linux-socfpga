@@ -267,7 +267,7 @@ static void msgdma_desc_config(struct msgdma_reg_desc *desc,
 	 * Don't set interrupt on xfer end yet, this will be done later
 	 * for the "last" descriptor
 	 */
-	desc->control = MSGDMA_DESC_CTL_TR_ERR_IRQ | MSGDMA_DESC_CTL_GO | MSGDMA_DESC_CTL_EARLY_IRQ;
+	desc->control = MSGDMA_DESC_CTL_GO;
 }
 
 /**
@@ -276,7 +276,7 @@ static void msgdma_desc_config(struct msgdma_reg_desc *desc,
  */
 static void msgdma_desc_config_eod(struct msgdma_reg_desc *desc)
 {
-	desc->control |= MSGDMA_DESC_CTL_TR_COMP_IRQ;
+	desc->control |= (MSGDMA_DESC_CTL_TR_COMP_IRQ | MSGDMA_DESC_CTL_EARLY_IRQ);
 }
 
 /**
@@ -478,8 +478,7 @@ static void msgdma_reset(struct msgdma_device *mdev)
 	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
 
 	/* Enable the DMA controller including interrupts */
-	iowrite32(MSGDMA_CSR_CTL_STOP_ON_ERR | MSGDMA_CSR_CTL_STOP_ON_EARLY |
-		  MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
+	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
 
 	mdev->idle = true;
 
@@ -510,12 +509,27 @@ static void msgdma_copy_one(struct msgdma_device *mdev,
 	 * sure this control word is written last by single coding it and
 	 * adding some write-barriers here.
 	 */
-	memcpy((void __force *)hw_desc, &desc->hw_desc,
-	       sizeof(desc->hw_desc) - sizeof(u32));
+	//memcpy((void __force *)hw_desc, &desc->hw_desc, sizeof(desc->hw_desc) - sizeof(u32));
+
+	dev_dbg(mdev->dev, "%s: read_addr %x\n", __FUNCTION__, desc->hw_desc.read_addr);
+	iowrite32(desc->hw_desc.read_addr, hw_desc +
+		  offsetof(struct msgdma_reg_desc, read_addr));
+	wmb();
+
+	dev_dbg(mdev->dev, "%s: write_addr %x\n", __FUNCTION__, desc->hw_desc.write_addr);
+	iowrite32(desc->hw_desc.write_addr, hw_desc +
+		  offsetof(struct msgdma_reg_desc, write_addr));
+	wmb();
+
+	dev_dbg(mdev->dev, "%s: len %x\n", __FUNCTION__, desc->hw_desc.len);
+	iowrite32(desc->hw_desc.len, hw_desc +
+		  offsetof(struct msgdma_reg_desc, len));
+	wmb();
 
 	/* Write control word last to flush this descriptor into the FIFO */
 	mdev->idle = false;
 	wmb();
+	dev_dbg(mdev->dev, "%s: control %x\n", __FUNCTION__, desc->hw_desc.control);
 	iowrite32(desc->hw_desc.control, hw_desc +
 		  offsetof(struct msgdma_reg_desc, control));
 	wmb();
@@ -708,8 +722,9 @@ static void msgdma_tasklet(unsigned long data)
 	dev_dbg(mdev->dev, "%s (%d): response count=%d\n",
 		__func__, __LINE__, count);
 
-	while (count--) {
-		if (mdev->resp) {
+	/* ML: if we not support response register, we don't need that cycle */
+	if (mdev->resp) {
+		while (count--) {
 			/*
 			* Read both longwords to purge this response from the FIFO
 			* On Avalon-MM implementations, size and status do not
@@ -718,8 +733,11 @@ static void msgdma_tasklet(unsigned long data)
 			*/
 			size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
 			status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
-		}
 
+			msgdma_complete_descriptor(mdev);
+			msgdma_chan_desc_cleanup(mdev);
+		}
+	} else {
 		msgdma_complete_descriptor(mdev);
 		msgdma_chan_desc_cleanup(mdev);
 	}
