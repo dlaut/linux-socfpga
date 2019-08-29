@@ -265,9 +265,11 @@ static void msgdma_desc_config(struct msgdma_reg_desc *desc,
 
 	/*
 	 * Don't set interrupt on xfer end yet, this will be done later
-	 * for the "last" descriptor
+	 * for the "last" descriptor.
+	 * EOP is enabled for every transfer, since it is required by
+	 * some scenarios and it shouldn't create problems to those not using it.
 	 */
-	desc->control = MSGDMA_DESC_CTL_GO;
+	desc->control = MSGDMA_DESC_CTL_GO | MSGDMA_DESC_CTL_END_ON_EOP;
 }
 
 /**
