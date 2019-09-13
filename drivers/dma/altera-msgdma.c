@@ -766,30 +766,32 @@ static int msgdma_alloc_chan_resources(struct dma_chan *dchan)
 
 /**
  * msgdma_tasklet - Schedule completion tasklet
- * @data: Pointer to the Altera sSGDMA channel structure
+ * @data: Pointer to the Altera mSGDMA channel structure
  */
 static void msgdma_tasklet(unsigned long data)
 {
 	struct msgdma_device *mdev = (struct msgdma_device *)data;
-	u32 count;
-	u32 __maybe_unused size;
-	u32 __maybe_unused status;
 	unsigned long flags;
 
 	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
 
 	spin_lock_irqsave(&mdev->lock, flags);
 
-	/* Read number of responses that are available */
-	count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
-	dev_dbg(mdev->dev, "%s (%d): response count=%d\n",
-		__func__, __LINE__, count);
-
 	/* ML: if we not support response register, we don't need that cycle */
 	if (mdev->resp) {
+        /* Read number of responses that are available */
+        u32 count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
+        u32 size;
+	    u32 status;
+
+        dev_dbg(mdev->dev, "%s (%d): response count=%d\n",
+    		__func__, __LINE__, count);
+
 		while (count--) {
 			/*
-			* Read both longwords to purge this response from the FIFO
+            * When dma is setup as a memory-mapped slave port, reading
+            * byte offset 0x7 pops the response from the response FIFO.
+            *
 			* On Avalon-MM implementations, size and status do not
 			* have any real values, like transferred bytes or error
 			* bits. So we need to just drop these values.
@@ -797,8 +799,10 @@ static void msgdma_tasklet(unsigned long data)
 			size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
 			status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
 
-			msgdma_complete_descriptor(mdev);
-			msgdma_chan_desc_cleanup(mdev);
+            if (!(status & MSGDMA_RESP_EARLY_TERM)) {
+                msgdma_complete_descriptor(mdev);
+                msgdma_chan_desc_cleanup(mdev);
+            }
 		}
 	} else {
 		msgdma_complete_descriptor(mdev);
