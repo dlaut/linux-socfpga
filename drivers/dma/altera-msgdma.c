@@ -23,6 +23,7 @@
 #include <linux/of_device.h>
 #include <linux/of_dma.h>
 #include <linux/of_irq.h>
+#include <asm/io.h>
 
 #include "dmaengine.h"
 
@@ -188,6 +189,8 @@ struct msgdma_device {
 	/* mSGDMA response */
 	void __iomem *resp;
 	int resp_enabled;
+
+    wait_queue_head_t waitQueue;
 };
 
 #define to_mdev(chan)	container_of(chan, struct msgdma_device, dmachan)
@@ -457,6 +460,64 @@ static int msgdma_dma_config(struct dma_chan *dchan,
 	memcpy(&mdev->slave_cfg, config, sizeof(*config));
 
 	return 0;
+}
+
+/* NOTE: this is actually a reset function. Its purpose is to export a reset
+    API using dmaengine's 'device_terminate_all' API, which is the closest
+    to a reset API we found in the current APIs. */
+static int msgdma_terminate(struct dma_chan *dchan) {
+
+    struct msgdma_device *mdev = to_mdev(dchan);
+    unsigned long flags;
+    struct msgdma_sw_desc *desc, *next;
+
+	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+
+    /* free pending sw descriptors */
+    spin_lock_irqsave(&mdev->lock, flags);
+
+    if (&mdev->active_list) {
+        desc = list_first_entry_or_null(&mdev->active_list,
+                        struct msgdma_sw_desc, node);
+        if (desc) {
+            list_del(&desc->node);
+            dma_cookie_complete(&desc->async_tx);
+            list_add_tail(&desc->node, &mdev->done_list);
+        }
+    }
+
+    if (&mdev->done_list) {
+        list_for_each_entry_safe(desc, next, &mdev->done_list, node) {
+            list_del(&desc->node);
+
+            /* Run any dependencies, then free the descriptor */
+            msgdma_free_descriptor(mdev, desc);
+        }
+    }
+
+    spin_unlock_irqrestore(&mdev->lock, flags);
+
+	/* Reset mSGDMA */
+	iowrite32(MSGDMA_CSR_CTL_RESET, mdev->csr + MSGDMA_CSR_CONTROL);
+    smp_wmb(); /* barrier to be sure everything is written */
+
+    /* x * HZ ---> wait for x seconds */
+    if (wait_event_interruptible_timeout(mdev->waitQueue, (ioread32(mdev->csr + MSGDMA_CSR_CONTROL) & MSGDMA_CSR_STAT_RESETTING) == 0, 1 * HZ) <= 0) {
+        dev_err(mdev->dev, "DMA channel did not reset\n");
+        return -ERESTARTSYS;
+    }
+
+	/* Clear all status bits */
+	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
+
+	/* Enable the DMA controller including interrupts */
+	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
+
+	mdev->idle = true;
+
+	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+
+    return 0;
 }
 
 static void msgdma_reset(struct msgdma_device *mdev)
@@ -907,7 +968,7 @@ static int msgdma_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&mdev->active_list);
 	INIT_LIST_HEAD(&mdev->pending_list);
 	INIT_LIST_HEAD(&mdev->done_list);
-	INIT_LIST_HEAD(&mdev->free_list);
+	// INIT_LIST_HEAD(&mdev->free_list);
 
 	dma_dev = &mdev->dmadev;
 
@@ -925,6 +986,9 @@ static int msgdma_probe(struct platform_device *pdev)
 	/* Init DMA link list */
 	INIT_LIST_HEAD(&dma_dev->channels);
 
+    /* init the wait queue */
+	init_waitqueue_head(&mdev->waitQueue);
+
 	/* Set base routines */
 	dma_dev->device_tx_status = dma_cookie_status;
 	dma_dev->device_issue_pending = msgdma_issue_pending;
@@ -937,6 +1001,7 @@ static int msgdma_probe(struct platform_device *pdev)
 
 	dma_dev->device_alloc_chan_resources = msgdma_alloc_chan_resources;
 	dma_dev->device_free_chan_resources = msgdma_free_chan_resources;
+    dma_dev->device_terminate_all = msgdma_terminate;
 
 	mdev->dmachan.device = dma_dev;
 	list_add_tail(&mdev->dmachan.device_node, &dma_dev->channels);
