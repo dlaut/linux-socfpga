@@ -12,15 +12,33 @@
 #include <asm/hardware/cache-l2x0.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
+#include <asm/pmu.h>
 #include <asm/cacheflush.h>
 
 #include "core.h"
+#include "socfpga_cti.h"
 
 void __iomem *sys_manager_base_addr;
 void __iomem *rst_manager_base_addr;
 void __iomem *sdr_ctl_base_addr;
 unsigned long socfpga_cpu1start_addr;
 void __iomem *clkmgr_base_addr;
+
+#ifdef CONFIG_HW_PERF_EVENTS
+static struct arm_pmu_platdata socfpga_pmu_platdata = {
+	.handle_irq = socfpga_pmu_handler,
+	.init = socfpga_init_cti,
+	.start = socfpga_start_cti,
+	.stop = socfpga_stop_cti,
+};
+#endif
+
+static const struct of_dev_auxdata socfpga_auxdata_lookup[] __initconst = {
+#ifdef CONFIG_HW_PERF_EVENTS
+	OF_DEV_AUXDATA("arm,cortex-a9-pmu", 0, "arm-pmu", &socfpga_pmu_platdata),
+#endif
+	{ /* sentinel */ }
+};
 
 static void __init socfpga_sysmgr_init(void)
 {
@@ -101,6 +119,12 @@ static void socfpga_arria10_restart(enum reboot_mode mode, const char *cmd)
 	writel(temp, rst_manager_base_addr + SOCFPGA_A10_RSTMGR_CTRL);
 }
 
+static void __init socfpga_cyclone5_init(void)
+{
+	of_platform_populate(NULL, of_default_bus_match_table,
+			     socfpga_auxdata_lookup, NULL);
+}
+
 static const char *altera_dt_match[] = {
 	"altr,socfpga",
 	NULL
@@ -110,6 +134,7 @@ DT_MACHINE_START(SOCFPGA, "Altera SOCFPGA")
 	.l2c_aux_val	= 0,
 	.l2c_aux_mask	= ~0,
 	.init_irq	= socfpga_init_irq,
+	.init_machine	= socfpga_cyclone5_init,
 	.restart	= socfpga_cyclone5_restart,
 	.dt_compat	= altera_dt_match,
 MACHINE_END
