@@ -141,6 +141,10 @@ static loff_t dma_buf_llseek(struct file *file, loff_t offset, int whence)
 
 	dmabuf = file->private_data;
 
+	/* Use dma_buf_ops if defined */
+	if (dmabuf->ops->llseek)
+		return dmabuf->ops->llseek(dmabuf, offset, whence);
+
 	/* only support discovering the end of the buffer,
 	   but also allow SEEK_SET to maintain the idiomatic
 	   SEEK_END(0), SEEK_CUR(0) pattern */
@@ -410,6 +414,23 @@ static void dma_buf_show_fdinfo(struct seq_file *m, struct file *file)
 	spin_unlock(&dmabuf->name_lock);
 }
 
+static ssize_t dma_buf_splice_read(struct file *file, loff_t *ppos,
+				   struct pipe_inode_info *pipe, size_t len,
+				   unsigned int flags)
+{
+	struct dma_buf *dmabuf;
+
+	if (!is_dma_buf_file(file))
+		return -EINVAL;
+
+	dmabuf = file->private_data;
+
+	if (unlikely(!dmabuf->ops->splice_read))
+		return -EINVAL;
+
+	return dmabuf->ops->splice_read(dmabuf, ppos, pipe, len, flags);
+}
+
 static const struct file_operations dma_buf_fops = {
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
@@ -419,6 +440,7 @@ static const struct file_operations dma_buf_fops = {
 	.compat_ioctl	= dma_buf_ioctl,
 #endif
 	.show_fdinfo	= dma_buf_show_fdinfo,
+	.splice_read	= dma_buf_splice_read,
 };
 
 /*
