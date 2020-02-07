@@ -31,6 +31,9 @@ struct dma_buf_attachment;
  * @vmap: [optional] creates a virtual mapping for the buffer into kernel
  *	  address space. Same restrictions as for vmap and friends apply.
  * @vunmap: [optional] unmaps a vmap from the buffer
+ * @splice_read: [optional] use as source for a splice operation.
+ * @llseek: [optional] change current position of the file associated with the
+ *          dmabuf.
  */
 struct dma_buf_ops {
 	/**
@@ -261,6 +264,10 @@ struct dma_buf_ops {
 
 	void *(*vmap)(struct dma_buf *);
 	void (*vunmap)(struct dma_buf *, void *vaddr);
+	ssize_t (*splice_read)(struct dma_buf *, loff_t *ppos,
+			       struct pipe_inode_info *pipe, size_t len,
+			       unsigned int flags);
+	loff_t (*llseek)(struct dma_buf *, loff_t offset, int whence);
 };
 
 /**
