@@ -103,6 +103,10 @@ static loff_t dma_buf_llseek(struct file *file, loff_t offset, int whence)
 
 	dmabuf = file->private_data;
 
+	/* Use dma_buf_ops if defined */
+	if (dmabuf->ops->llseek)
+		return dmabuf->ops->llseek(dmabuf, offset, whence);
+
 	/* only support discovering the end of the buffer,
 	   but also allow SEEK_SET to maintain the idiomatic
 	   SEEK_END(0), SEEK_CUR(0) pattern */
@@ -249,11 +253,29 @@ out:
 	return events;
 }
 
+static ssize_t dma_buf_splice_read(struct file *file, loff_t *ppos,
+				   struct pipe_inode_info *pipe, size_t len,
+				   unsigned int flags)
+{
+	struct dma_buf *dmabuf;
+
+	if (!is_dma_buf_file(file))
+		return -EINVAL;
+
+	dmabuf = file->private_data;
+
+	if (unlikely(!dmabuf->ops->splice_read))
+		return -EINVAL;
+
+	return dmabuf->ops->splice_read(dmabuf, ppos, pipe, len, flags);
+}
+
 static const struct file_operations dma_buf_fops = {
 	.release	= dma_buf_release,
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,
+	.splice_read	= dma_buf_splice_read,
 };
 
 /*
