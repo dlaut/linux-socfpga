@@ -484,10 +484,6 @@ static int ksz9021_config_init(struct phy_device *phydev)
 #define KSZ9031_PS_TO_REG		60
 
 /* Extended registers */
-/* MMD Address 0x0 */
-#define MII_KSZ9031RN_FLP_BURST_TX_LO	3
-#define MII_KSZ9031RN_FLP_BURST_TX_HI	4
-
 /* MMD Address 0x2 */
 #define MII_KSZ9031RN_CONTROL_PAD_SKEW	4
 #define MII_KSZ9031RN_RX_DATA_PAD_SKEW	5
@@ -533,24 +529,6 @@ static int ksz9031_of_load_skew_values(struct phy_device *phydev,
 		}
 
 	return phy_write_mmd(phydev, 2, reg, newval);
-}
-
-/* Center KSZ9031RNX FLP timing at 16ms. */
-static int ksz9031_center_flp_timing(struct phy_device *phydev)
-{
-	int result;
-
-	result = phy_write_mmd(phydev, 0, MII_KSZ9031RN_FLP_BURST_TX_HI,
-			       0x0006);
-	if (result)
-		return result;
-
-	result = phy_write_mmd(phydev, 0, MII_KSZ9031RN_FLP_BURST_TX_LO,
-			       0x1A80);
-	if (result)
-		return result;
-
-	return genphy_restart_aneg(phydev);
 }
 
 /* Enable energy-detect power-down mode */
@@ -641,7 +619,7 @@ static int ksz9031_config_init(struct phy_device *phydev)
 		}
 	}
 
-	return ksz9031_center_flp_timing(phydev);
+	return 0;
 
 err_force_master:
 	phydev_err(phydev, "failed to force the phy to master mode\n");
