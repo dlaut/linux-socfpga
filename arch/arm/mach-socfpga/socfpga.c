@@ -25,9 +25,11 @@
 #include <asm/hardware/cache-l2x0.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
+#include <asm/pmu.h>
 #include <asm/cacheflush.h>
 
 #include "core.h"
+#include "socfpga_cti.h"
 #include "l2_cache.h"
 #include "ocram.h"
 #include "nand.h"
@@ -37,6 +39,22 @@ void __iomem *rst_manager_base_addr;
 void __iomem *sdr_ctl_base_addr;
 unsigned long socfpga_cpu1start_addr;
 void __iomem *clkmgr_base_addr;
+
+#ifdef CONFIG_HW_PERF_EVENTS
+static struct arm_pmu_platdata socfpga_pmu_platdata = {
+	.handle_irq = socfpga_pmu_handler,
+	.init = socfpga_init_cti,
+	.start = socfpga_start_cti,
+	.stop = socfpga_stop_cti,
+};
+#endif
+
+static const struct of_dev_auxdata socfpga_auxdata_lookup[] __initconst = {
+#ifdef CONFIG_HW_PERF_EVENTS
+	OF_DEV_AUXDATA("arm,cortex-a9-pmu", 0, "arm-pmu", &socfpga_pmu_platdata),
+#endif
+	{ /* sentinel */ }
+};
 
 static int socfpga_is_a10(void);
 
@@ -174,7 +192,7 @@ static void socfpga_arria10_restart(enum reboot_mode mode, const char *cmd)
 static void __init socfpga_cyclone5_init(void)
 {
 	of_platform_populate(NULL, of_default_bus_match_table,
-			     NULL, NULL);
+			     socfpga_auxdata_lookup, NULL);
 	enable_periphs();
 	socfpga_soc_device_init();
 	socfpga_init_ocram_ecc();

@@ -21,6 +21,9 @@
 #include <linux/nwpserial.h>
 #include <linux/clk.h>
 
+#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
+
 #include "8250/8250.h"
 
 struct of_serial_info {
@@ -28,6 +31,12 @@ struct of_serial_info {
 	int type;
 	int line;
 };
+
+struct serial_gpios {
+    struct gpio_desc *shutdown_gpio; /* Shutdown gpio used in SOC platform */
+	struct gpio_desc *rs485sel_gpio; /* Gpio to select elettrical interface in SOC platform */
+};
+
 
 #ifdef CONFIG_ARCH_TEGRA
 void tegra_serial_handle_break(struct uart_port *p)
@@ -50,6 +59,29 @@ static inline void tegra_serial_handle_break(struct uart_port *port)
 {
 }
 #endif
+
+static int altera_uart_config_rs485(struct uart_port *port, struct serial_rs485 *rs485conf)
+{
+    struct serial_gpios *portGPIOs = (struct serial_gpios *) port->private_data;
+    int shutdown_state = gpiod_get_value(portGPIOs->shutdown_gpio);
+
+	if (shutdown_state < 0)
+		shutdown_state = 0;
+
+	gpiod_set_value(portGPIOs->shutdown_gpio, 0);
+
+	if (rs485conf->flags & SER_RS485_ENABLED) {
+		dev_dbg(port->dev, "Setting UART to RS485\n");
+		gpiod_set_value(portGPIOs->rs485sel_gpio, 1);
+	} else {
+		dev_dbg(port->dev, "Setting UART to RS232\n");
+		gpiod_set_value(portGPIOs->rs485sel_gpio, 0);
+	}
+
+	gpiod_set_value(portGPIOs->shutdown_gpio, shutdown_state);
+
+	return 0;
+}
 
 /*
  * Fill a struct uart_port for a given device node
@@ -181,6 +213,36 @@ static int of_platform_serial_probe(struct platform_device *ofdev)
 	ret = of_platform_serial_setup(ofdev, port_type, &port, info);
 	if (ret)
 		goto out;
+
+    struct serial_gpios *portGPIOs;
+
+    portGPIOs = kzalloc(sizeof(*portGPIOs), GFP_KERNEL);
+    if (portGPIOs == NULL)
+        return -ENOMEM;
+
+    /* Reserve GPIOs */
+    portGPIOs->shutdown_gpio = devm_gpiod_get(&ofdev->dev, "shtdn", GPIOD_OUT_LOW);
+    if (IS_ERR(portGPIOs->shutdown_gpio)) {
+        dev_warn(&ofdev->dev, "cannot get shtdn-gpios %ld\n",
+            PTR_ERR(portGPIOs->shutdown_gpio));
+    }
+    portGPIOs->rs485sel_gpio = devm_gpiod_get(&ofdev->dev, "rs485_rs232", GPIOD_OUT_LOW);
+    if (IS_ERR(portGPIOs->rs485sel_gpio)) {
+        dev_warn(&ofdev->dev, "cannot get rs485_rs232-gpios %ld\n",
+            PTR_ERR(portGPIOs->rs485sel_gpio));
+    }
+
+    // NOTE: this is memory leak, since you will not be able to deallocate portGPIOs
+    if (!IS_ERR(portGPIOs->shutdown_gpio) && !IS_ERR(portGPIOs->rs485sel_gpio)) {
+        port.private_data = (void *)portGPIOs;
+        gpiod_set_value(portGPIOs->shutdown_gpio, 1);
+        port.rs485_config = altera_uart_config_rs485;
+        dev_info(&ofdev->dev, "GPIO(s) found");
+    } else {
+        dev_info(&ofdev->dev, "GPIO(s) not found");
+        kfree(portGPIOs);
+    }
+
 
 	switch (port_type) {
 #ifdef CONFIG_SERIAL_8250

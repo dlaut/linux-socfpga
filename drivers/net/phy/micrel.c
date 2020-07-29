@@ -366,10 +366,6 @@ static int ksz9021_config_init(struct phy_device *phydev)
 #define KSZ9031_PS_TO_REG		60
 
 /* Extended registers */
-/* MMD Address 0x0 */
-#define MII_KSZ9031RN_FLP_BURST_TX_LO	3
-#define MII_KSZ9031RN_FLP_BURST_TX_HI	4
-
 /* MMD Address 0x2 */
 #define MII_KSZ9031RN_CONTROL_PAD_SKEW	4
 #define MII_KSZ9031RN_RX_DATA_PAD_SKEW	5
@@ -431,22 +427,6 @@ static int ksz9031_of_load_skew_values(struct phy_device *phydev,
 	return ksz9031_extended_write(phydev, OP_DATA, 2, reg, newval);
 }
 
-static int ksz9031_center_flp_timing(struct phy_device *phydev)
-{
-	int result;
-
-	/* Center KSZ9031RNX FLP timing at 16ms. */
-	result = ksz9031_extended_write(phydev, OP_DATA, 0,
-					MII_KSZ9031RN_FLP_BURST_TX_HI, 0x0006);
-	result = ksz9031_extended_write(phydev, OP_DATA, 0,
-					MII_KSZ9031RN_FLP_BURST_TX_LO, 0x1A80);
-
-	if (result)
-		return result;
-
-	return genphy_restart_aneg(phydev);
-}
-
 static int ksz9031_config_init(struct phy_device *phydev)
 {
 	const struct device *dev = &phydev->dev;
@@ -482,8 +462,32 @@ static int ksz9031_config_init(struct phy_device *phydev)
 				MII_KSZ9031RN_TX_DATA_PAD_SKEW, 4,
 				tx_data_skews, 4);
 	}
+	return 0;
+}
 
-	return ksz9031_center_flp_timing(phydev);
+static int ksz9031_read_status(struct phy_device *phydev)
+{
+	int err;
+	int regval;
+
+	err = genphy_read_status(phydev);
+	if (err)
+		return err;
+
+	/* Make sure the PHY is not broken. Read idle error count,
+	 * and reset the PHY if it is maxed out.
+	 */
+	regval = phy_read(phydev, MII_STAT1000);
+	if ((regval & 0xFF) == 0xFF) {
+		printk(KERN_INFO "PHY broken, reset PHY...\n");
+		phy_init_hw(phydev);
+		phydev->link = 0;
+		if (phydev->drv->config_intr && phy_interrupt_is_valid(phydev))
+			phydev->drv->config_intr(phydev);
+		return genphy_config_aneg(phydev);
+	}
+
+	return 0;
 }
 
 #define KSZ8873MLL_GLOBAL_CONTROL_4	0x06
@@ -772,7 +776,7 @@ static struct phy_driver ksphy_driver[] = {
 	.driver_data	= &ksz9021_type,
 	.config_init	= ksz9031_config_init,
 	.config_aneg	= genphy_config_aneg,
-	.read_status	= genphy_read_status,
+	.read_status	= ksz9031_read_status,
 	.ack_interrupt	= kszphy_ack_interrupt,
 	.config_intr	= kszphy_config_intr,
 	.suspend	= genphy_suspend,

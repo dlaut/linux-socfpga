@@ -1,0 +1,5 @@
+config FORCE_DMA_BUFFER
+        tristate "Force DMA Buffer"
+        select DMA_SHARED_BUFFER
+        help
+          This option force dma-buf compilation.

@@ -51,6 +51,12 @@ config INTEL_MIC_X100_DMA
 	  OS and tools for MIC to use with this driver are available from
 	  <http://software.intel.com/en-us/mic-developer>.
 
+config ALTERA_MSGDMA
+	tristate "Altera / Intel mSGDMA Engine"
+	select DMA_ENGINE
+	help
+	  Enable support for Altera / Intel mSGDMA controller.
+
 config ASYNC_TX_ENABLE_CHANNEL_SWITCH
 	bool
 
