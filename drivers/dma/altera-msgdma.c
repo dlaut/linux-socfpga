@@ -189,8 +189,6 @@ struct msgdma_device {
 	/* mSGDMA response */
 	void __iomem *resp;
 	int resp_enabled;
-
-    wait_queue_head_t waitQueue;
 };
 
 #define to_mdev(chan)	container_of(chan, struct msgdma_device, dmachan)
@@ -245,8 +243,21 @@ static void msgdma_free_desc_list(struct msgdma_device *mdev,
 {
 	struct msgdma_sw_desc *desc, *next;
 
-	list_for_each_entry_safe(desc, next, list, node)
+	list_for_each_entry_safe(desc, next, list, node) {
+		list_del(&desc->node);
 		msgdma_free_descriptor(mdev, desc);
+	}
+}
+
+/**
+ * msgdma_free_descriptors - Free channel descriptors
+ * @mdev: Pointer to the Altera mSGDMA device structure
+ */
+static void msgdma_free_descriptors(struct msgdma_device *mdev)
+{
+	msgdma_free_desc_list(mdev, &mdev->active_list);
+	msgdma_free_desc_list(mdev, &mdev->pending_list);
+	msgdma_free_desc_list(mdev, &mdev->done_list);
 }
 
 /**
@@ -462,64 +473,6 @@ static int msgdma_dma_config(struct dma_chan *dchan,
 	return 0;
 }
 
-/* NOTE: this is actually a reset function. Its purpose is to export a reset
-    API using dmaengine's 'device_terminate_all' API, which is the closest
-    to a reset API we found in the current APIs. */
-static int msgdma_terminate(struct dma_chan *dchan) {
-
-    struct msgdma_device *mdev = to_mdev(dchan);
-    unsigned long flags;
-    struct msgdma_sw_desc *desc, *next;
-
-	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
-
-    /* free pending sw descriptors */
-    spin_lock_irqsave(&mdev->lock, flags);
-
-    if (&mdev->active_list) {
-        desc = list_first_entry_or_null(&mdev->active_list,
-                        struct msgdma_sw_desc, node);
-        if (desc) {
-            list_del(&desc->node);
-            dma_cookie_complete(&desc->async_tx);
-            list_add_tail(&desc->node, &mdev->done_list);
-        }
-    }
-
-    if (&mdev->done_list) {
-        list_for_each_entry_safe(desc, next, &mdev->done_list, node) {
-            list_del(&desc->node);
-
-            /* Run any dependencies, then free the descriptor */
-            msgdma_free_descriptor(mdev, desc);
-        }
-    }
-
-    spin_unlock_irqrestore(&mdev->lock, flags);
-
-	/* Reset mSGDMA */
-	iowrite32(MSGDMA_CSR_CTL_RESET, mdev->csr + MSGDMA_CSR_CONTROL);
-    smp_wmb(); /* barrier to be sure everything is written */
-
-    /* x * HZ ---> wait for x seconds */
-    if (wait_event_interruptible_timeout(mdev->waitQueue, (ioread32(mdev->csr + MSGDMA_CSR_CONTROL) & MSGDMA_CSR_STAT_RESETTING) == 0, 1 * HZ) <= 0) {
-        dev_err(mdev->dev, "DMA channel did not reset\n");
-        return -ERESTARTSYS;
-    }
-
-	/* Clear all status bits */
-	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
-
-	/* Enable the DMA controller including interrupts */
-	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
-
-	mdev->idle = true;
-
-	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
-
-    return 0;
-}
-
 static void msgdma_reset(struct msgdma_device *mdev)
 {
 	u32 val;
@@ -531,9 +484,9 @@ static void msgdma_reset(struct msgdma_device *mdev)
 	iowrite32(MSGDMA_CSR_STAT_MASK, mdev->csr + MSGDMA_CSR_STATUS);
 	iowrite32(MSGDMA_CSR_CTL_RESET, mdev->csr + MSGDMA_CSR_CONTROL);
 
-	ret = readl_poll_timeout(mdev->csr + MSGDMA_CSR_STATUS, val,
-				 (val & MSGDMA_CSR_STAT_RESETTING) == 0,
-				 1, 10000);
+	ret = readl_poll_timeout_atomic(mdev->csr + MSGDMA_CSR_STATUS, val,
+					(val & MSGDMA_CSR_STAT_RESETTING) == 0,
+					1, 10000);
 	if (ret)
 		dev_err(mdev->dev, "DMA channel did not reset\n");
 
@@ -546,7 +499,32 @@ static void msgdma_reset(struct msgdma_device *mdev)
 	mdev->idle = true;
 
 	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
-};
+}
+
+/* NOTE: this is actually a reset function. Its purpose is to export a reset
+    API using dmaengine's 'device_terminate_all' API, which is the closest
+    to a reset API we found in the current APIs. */
+static int msgdma_terminate(struct dma_chan *dchan) {
+
+    struct msgdma_device *mdev = to_mdev(dchan);
+    unsigned long flags;
+
+    dev_dbg(mdev->dev, "%s: start", __FUNCTION__);
+
+    spin_lock_irqsave(&mdev->lock, flags);
+
+    /* Free all sw descriptors */
+    msgdma_free_descriptors(mdev);
+
+    /* HW reset of DMA */
+    msgdma_reset(mdev);
+
+    spin_unlock_irqrestore(&mdev->lock, flags);
+
+    dev_dbg(mdev->dev, "%s: end", __FUNCTION__);
+
+    return 0;
+}
 
 static void msgdma_copy_one(struct msgdma_device *mdev,
 			    struct msgdma_sw_desc *desc)
@@ -708,17 +686,6 @@ static void msgdma_complete_descriptor(struct msgdma_device *mdev)
 }
 
 /**
- * msgdma_free_descriptors - Free channel descriptors
- * @mdev: Pointer to the Altera mSGDMA device structure
- */
-static void msgdma_free_descriptors(struct msgdma_device *mdev)
-{
-	msgdma_free_desc_list(mdev, &mdev->active_list);
-	msgdma_free_desc_list(mdev, &mdev->pending_list);
-	msgdma_free_desc_list(mdev, &mdev->done_list);
-}
-
-/**
  * msgdma_free_chan_resources - Free channel resources
  * @dchan: DMA channel pointer
  */
@@ -773,36 +740,34 @@ static void msgdma_tasklet(unsigned long data)
 	struct msgdma_device *mdev = (struct msgdma_device *)data;
 	unsigned long flags;
 
-	dev_dbg(mdev->dev, "%s: start\n", __FUNCTION__);
+	dev_dbg(mdev->dev, "%s: start", __FUNCTION__);
 
 	spin_lock_irqsave(&mdev->lock, flags);
 
 	/* ML: if we not support response register, we don't need that cycle */
 	if (mdev->resp) {
-        /* Read number of responses that are available */
-        u32 count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
-        u32 size;
-	    u32 status;
+		/* Read number of responses that are available */
+		u32 count = ioread32(mdev->csr + MSGDMA_CSR_RESP_FILL_LEVEL);
 
-        dev_dbg(mdev->dev, "%s (%d): response count=%d\n",
-    		__func__, __LINE__, count);
+		dev_dbg(mdev->dev, "%s (%d): response count=%d",
+			__func__, __LINE__, count);
 
 		while (count--) {
 			/*
-            * When dma is setup as a memory-mapped slave port, reading
-            * byte offset 0x7 pops the response from the response FIFO.
-            *
-			* On Avalon-MM implementations, size and status do not
-			* have any real values, like transferred bytes or error
-			* bits. So we need to just drop these values.
-			*/
-			size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
-			status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
+			 * When dma is setup as a memory-mapped slave port, reading
+			 * byte offset 0x7 pops the response from the response FIFO.
+			 *
+			 * On Avalon-MM implementations, size and status do not
+			 * have any real values, like transferred bytes or error
+			 * bits. So we need to just drop these values.
+			 */
+			u32 size = ioread32(mdev->resp + MSGDMA_RESP_BYTES_TRANSFERRED);
+			u32 status = ioread32(mdev->resp + MSGDMA_RESP_STATUS);
 
-            if (!(status & MSGDMA_RESP_EARLY_TERM)) {
-                msgdma_complete_descriptor(mdev);
-                msgdma_chan_desc_cleanup(mdev);
-            }
+			if (!(status & MSGDMA_RESP_EARLY_TERM)) {
+				msgdma_complete_descriptor(mdev);
+				msgdma_chan_desc_cleanup(mdev);
+			}
 		}
 	} else {
 		msgdma_complete_descriptor(mdev);
@@ -811,7 +776,7 @@ static void msgdma_tasklet(unsigned long data)
 
 	spin_unlock_irqrestore(&mdev->lock, flags);
 
-	dev_dbg(mdev->dev, "%s: end\n", __FUNCTION__);
+	dev_dbg(mdev->dev, "%s: end", __FUNCTION__);
 
 }
 
@@ -990,9 +955,6 @@ static int msgdma_probe(struct platform_device *pdev)
 	/* Init DMA link list */
 	INIT_LIST_HEAD(&dma_dev->channels);
 
-    /* init the wait queue */
-	init_waitqueue_head(&mdev->waitQueue);
-
 	/* Set base routines */
 	dma_dev->device_tx_status = dma_cookie_status;
 	dma_dev->device_issue_pending = msgdma_issue_pending;
@@ -1005,7 +967,7 @@ static int msgdma_probe(struct platform_device *pdev)
 
 	dma_dev->device_alloc_chan_resources = msgdma_alloc_chan_resources;
 	dma_dev->device_free_chan_resources = msgdma_free_chan_resources;
-    dma_dev->device_terminate_all = msgdma_terminate;
+	dma_dev->device_terminate_all = msgdma_terminate;
 
 	mdev->dmachan.device = dma_dev;
 	list_add_tail(&mdev->dmachan.device_node, &dma_dev->channels);
