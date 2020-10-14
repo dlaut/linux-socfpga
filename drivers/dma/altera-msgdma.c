@@ -728,6 +728,9 @@ static int msgdma_alloc_chan_resources(struct dma_chan *dchan)
 		list_add_tail(&desc->node, &mdev->free_list);
 	}
 
+	/* Enable the DMA controller including interrupts  */
+	iowrite32(MSGDMA_CSR_CTL_GLOBAL_INTR, mdev->csr + MSGDMA_CSR_CONTROL);
+
 	return MSGDMA_DESC_NUM;
 }
 
