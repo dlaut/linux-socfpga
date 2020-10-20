@@ -26,7 +26,7 @@ static unsigned long clk_mpuclk_recalc_rate(struct clk_hw *hwclk,
 	} else {
 		if (socfpgaclk->div_reg) {
 			val = readl(socfpgaclk->div_reg) >> socfpgaclk->shift;
-			val &= div_mask(socfpgaclk->width);
+			val &= GENMASK(socfpgaclk->width - 1, 0);
 			parent_rate /= (val + 1);
 		}
 		div = ((readl(socfpgaclk->hw.reg) & 0x1ff) + 1);
@@ -60,7 +60,7 @@ static long clk_mpuclk_round_rate(struct clk_hw *hw, unsigned long rate, unsigne
 	else {
 		if (socfpgaclk->div_reg) {
 			val = readl(socfpgaclk->div_reg) >> socfpgaclk->shift;
-			val &= div_mask(socfpgaclk->width);
+			val &= GENMASK(socfpgaclk->width - 1, 0);
 			val++;
 		}
 		div = ((readl(socfpgaclk->hw.reg) & 0x1ff) + 1);
