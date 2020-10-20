@@ -30,9 +30,6 @@
 
 #define ldev_to_led(c)       container_of(c, struct pca9532_led, ldev)
 
-/* Add "pca9532_async" paramater in DTS to make driver async */
-static bool pca9532_async = false;
-
 struct pca9532_chip_info {
 	u8	num_leds;
 };
@@ -172,14 +169,7 @@ static void pca9532_setled(struct pca9532_led *led)
 	mutex_unlock(&data->update_lock);
 }
 
-static void pca9532_led_work_inner(struct pca9532_led *led)
-{
-	if (led->state == PCA9532_PWM0)
-		pca9532_setpwm(led->client, 0);
-	pca9532_setled(led);
-}
-
-static void pca9532_set_brightness(struct led_classdev *led_cdev,
+static int pca9532_set_brightness(struct led_classdev *led_cdev,
 	enum led_brightness value)
 {
 	int err = 0;
@@ -195,14 +185,9 @@ static void pca9532_set_brightness(struct led_classdev *led_cdev,
 		if (err)
 			return err;
 	}
-	if (pca9532_async)
-	{
-		schedule_work(&led->work);
-	}
-	else
-	{
-		pca9532_led_work_inner(led);
-	}
+	if (led->state == PCA9532_PWM0)
+		pca9532_setpwm(led->client, 0);
+	pca9532_setled(led);
 	return err;
 }
 
@@ -227,14 +212,10 @@ static int pca9532_set_blink(struct led_classdev *led_cdev,
 	err = pca9532_calcpwm(client, 0, psc, led_cdev->brightness);
 	if (err)
 		return err;
-	if (pca9532_async)
-	{
-		schedule_work(&led->work);
-	}
-	else
-	{
-		pca9532_led_work_inner(led);
-	}
+	if (led->state == PCA9532_PWM0)
+		pca9532_setpwm(led->client, 0);
+	pca9532_setled(led);
+
 	return 0;
 }
 
@@ -520,8 +501,6 @@ pca9532_of_populate_pdata(struct device *dev, struct device_node *np)
 			break;
 		}
 	}
-
-	pca9532_async = of_property_read_bool(np, "pca9532_async");
 
 	return pdata;
 }
