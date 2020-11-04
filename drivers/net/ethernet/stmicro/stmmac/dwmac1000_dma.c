@@ -77,6 +77,9 @@ static void dwmac1000_dma_init(void __iomem *ioaddr,
 	int txpbl = dma_cfg->txpbl ?: dma_cfg->pbl;
 	int rxpbl = dma_cfg->rxpbl ?: dma_cfg->pbl;
 
+
+	printk("%p, %x\n", ioaddr + DMA_BUS_MODE, value);
+
 	/*
 	 * Set the DMA PBL (Programmable Burst Length) mode.
 	 *

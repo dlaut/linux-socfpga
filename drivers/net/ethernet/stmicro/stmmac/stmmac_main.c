@@ -231,6 +231,7 @@ static void stmmac_clk_csr_set(struct stmmac_priv *priv)
 {
 	u32 clk_rate;
 
+	printk("%s\n", __func__);
 	clk_rate = clk_get_rate(priv->plat->stmmac_clk);
 
 	/* Platform provided default clk_csr would be assumed valid
@@ -2534,8 +2535,8 @@ static int stmmac_hw_setup(struct net_device *dev, bool init_ptp)
 	/* DMA initialization and SW reset */
 	ret = stmmac_init_dma_engine(priv);
 	if (ret < 0) {
-		netdev_err(priv->dev, "%s: DMA engine initialization failed\n",
-			   __func__);
+		netdev_err(priv->dev, "%s: DMA engine initialization failed (%d)\n",
+			   __func__, ret);
 		return ret;
 	}
 
@@ -4657,7 +4658,17 @@ int stmmac_dvr_probe(struct device *device,
 
 	stmmac_check_pcs_mode(priv);
 
-	if (priv->hw->pcs != STMMAC_PCS_RGMII  &&
+	// check for fixed phy
+	if (of_phy_is_fixed_link(priv->device->of_node)) {
+		int rc = of_phy_register_fixed_link(priv->device->of_node);
+		if (rc < 0) {
+			netdev_err(ndev, "cannot register fixed PHY\n");
+			goto error_mdio_register;
+		}
+
+		// ok, good, fixed phy has been registered and can be used later!
+		printk ("Using fixed PHY\n");
+	} else if (priv->hw->pcs != STMMAC_PCS_RGMII  &&
 	    priv->hw->pcs != STMMAC_PCS_TBI &&
 	    priv->hw->pcs != STMMAC_PCS_RTBI) {
 		/* MDIO bus Registration */
@@ -4843,8 +4854,12 @@ int stmmac_resume(struct device *dev)
 	struct net_device *ndev = dev_get_drvdata(dev);
 	struct stmmac_priv *priv = netdev_priv(ndev);
 
+	printk ("%\n", __func__);
+
 	if (!netif_running(ndev))
 		return 0;
+
+	printk ("%\n", __func__);
 
 	/* Power Down bit, into the PM register, is cleared
 	 * automatically as soon as a magic packet or a Wake-up frame
