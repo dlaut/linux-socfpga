@@ -55,3 +55,10 @@ config NET_DSA_MICROCHIP_KSZ8863_UART
 	help
 	  Select to enable support for registering switches configured through
 	  UART. It Supports the KSZ8863 and KSZ8873 Switch.
+
+config NET_DSA_MICROCHIP_KSZ8863_PCP
+	tristate "KSZ series PCP connected switch driver"
+	depends on NET_DSA_MICROCHIP_KSZ8795
+	help
+	  Select to enable support for registering switches configured through
+	  PCP. It Supports the KSZ8863 and KSZ8873 Switch.
