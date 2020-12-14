@@ -1366,8 +1366,8 @@ static int ksz8_setup(struct dsa_switch *ds)
 	ksz_cfg(dev, S_LINK_AGING_CTRL, SW_LINK_AUTO_AGING, true);
 
 	/* Enable aggressive back off algorithm in half duplex mode. */
-	regmap_update_bits(dev->regmap[0], REG_SW_CTRL_1,
-			   SW_AGGR_BACKOFF, SW_AGGR_BACKOFF);
+	/* regmap_update_bits(dev->regmap[0], REG_SW_CTRL_1, */
+	/* 		   SW_AGGR_BACKOFF, SW_AGGR_BACKOFF); */
 
 	/*
 	 * Make sure unicast VLAN boundary is set as default and
@@ -1384,6 +1384,9 @@ static int ksz8_setup(struct dsa_switch *ds)
 	ksz_cfg(dev, S_REPLACE_VID_CTRL, SW_REPLACE_VID, false);
 
 	ksz_cfg(dev, S_MIRROR_CTRL, SW_MIRROR_RX_TX, false);
+
+	/* set MII 10Mbps mode */
+	ksz_cfg(dev, REG_SW_CTRL_4, SW_10_MBIT, true);
 
 	/* set broadcast storm protection 10% rate */
 	regmap_update_bits(dev->regmap[1], S_REPLACE_VID_CTRL,
