@@ -214,12 +214,14 @@ static inline int ksz_read64(struct ksz_device *dev, u32 reg, u64 *val)
 	u32 value[2];
 	int ret;
 
-	ret = regmap_bulk_read(dev->regmap[2], reg, value, 2);
+	ret = ksz_read32(dev, reg, &value[0]);
+	if (!ret)
+		ret = ksz_read32(dev, reg + 4, &value[1]);
 	if (!ret) {
 		/* Ick! ToDo: Add 64bit R/W to regmap on 32bit systems */
 		value[0] = swab32(value[0]);
 		value[1] = swab32(value[1]);
-		*val = swab64((u64)*value);
+		*val = swab64(*((u64*)value));
 	}
 
 	return ret;
@@ -243,13 +245,18 @@ static inline int ksz_write32(struct ksz_device *dev, u32 reg, u32 value)
 static inline int ksz_write64(struct ksz_device *dev, u32 reg, u64 value)
 {
 	u32 val[2];
+	int ret;
 
 	/* Ick! ToDo: Add 64bit R/W to regmap on 32bit systems */
 	value = swab64(value);
 	val[0] = swab32(value & 0xffffffffULL);
 	val[1] = swab32(value >> 32ULL);
 
-	return regmap_bulk_write(dev->regmap[2], reg, val, 2);
+	ret = ksz_write32(dev, reg, val[0]);
+	if (!ret)
+		ret = ksz_write32(dev, reg + 4, val[1]);
+
+	return ret;
 }
 
 static inline void ksz_pread8(struct ksz_device *dev, int port, int offset,
