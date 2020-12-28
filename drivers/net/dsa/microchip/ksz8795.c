@@ -692,6 +692,7 @@ static void ksz8_w_vlan_table(struct ksz_device *dev, u16 vid, u32 vlan)
 
 		data[vid & 3] = vlan;
 	} else {
+		vlan |= vid;
 		buf = vlan;
 	}
 
