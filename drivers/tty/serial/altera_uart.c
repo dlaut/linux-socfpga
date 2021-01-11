@@ -83,8 +83,8 @@ struct altera_uart {
 	struct timer_list tmr;
 	unsigned int sigs;	/* Local copy of line sigs */
 	unsigned short imr;	/* Local IMR mirror */
-	struct gpio_desc *shutdown_gpio; /* Shutdown gpio used in SOC platform */
-	struct gpio_desc *rs485sel_gpio; /* Gpio to select elettrical interface in SOC platform */
+	struct gpio_desc *shutdown_gpio; /* Shutdown gpio used with MAX3160CAP */
+	struct gpio_desc *rs485sel_gpio; /* Gpio to select elettrical interface used with MAX3160CAP */
 };
 
 static u32 altera_uart_readl(struct uart_port *port, int reg)
@@ -351,7 +351,7 @@ static int altera_uart_startup(struct uart_port *port)
 
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	/* Enable SOC platform MAX3160CAP outputs */
+	/* Enable MAX3160CAP outputs */
 	gpiod_set_value(pp->shutdown_gpio, 1);
 
 	return 0;
@@ -361,15 +361,6 @@ static void altera_uart_shutdown(struct uart_port *port)
 {
 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
 	unsigned long flags;
-
-	/* Wait to be sure all chars are sent
-	 * ML: in our use, shutdown is never called (HAL opens device and let it opened),
-	 *     but if you use serial externally (e.g. via fs) sometimes the shutdown truncated
-	 *     the last character, so I introduced this delay */
-	msleep(10);
-
-	/* Disable SOC platform MAX3160CAP outputs */
-	gpiod_set_value(pp->shutdown_gpio, 0);
 
 	spin_lock_irqsave(&port->lock, flags);
 
@@ -388,10 +379,18 @@ static void altera_uart_shutdown(struct uart_port *port)
 static int altera_uart_config_rs485(struct uart_port *port, struct serial_rs485 *rs485conf)
 {
 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
-	int shutdown_state = gpiod_get_value(pp->shutdown_gpio);
+	if (!pp) {
+		/* the struct should always be available! instead, its optional GPIOs should be NULL */
+		dev_err(port->dev, "private_data not set up\n");
+		return -EINVAL;
+	}
 
-	if (shutdown_state < 0)
-		shutdown_state = 0;
+	/* 
+	 * NOTE: the following gpiod_set_value calls on 
+	 * optional GPIOs, will not produce any effect
+	 * if the GPIOs are not present.
+	 * So, don't care about NULL here.
+	 */
 
 	gpiod_set_value(pp->shutdown_gpio, 0);
 
@@ -403,7 +402,7 @@ static int altera_uart_config_rs485(struct uart_port *port, struct serial_rs485 
 		gpiod_set_value(pp->rs485sel_gpio, 0);
 	}
 
-	gpiod_set_value(pp->shutdown_gpio, shutdown_state);
+	gpiod_set_value(pp->shutdown_gpio, 1);
 
 	return 0;
 }
@@ -656,17 +655,17 @@ static int altera_uart_probe(struct platform_device *pdev)
 	port->rs485_config = altera_uart_config_rs485;
 
 	/* Reserve GPIOs */
-	pp->shutdown_gpio = devm_gpiod_get(&pdev->dev, "shtdn", GPIOD_OUT_LOW);
+	pp->shutdown_gpio = devm_gpiod_get_optional(&pdev->dev, "shtdn", GPIOD_OUT_HIGH);
 	if (IS_ERR(pp->shutdown_gpio)) {
-		dev_err(&pdev->dev, "cannot get shtdn-gpios %ld\n",
-			PTR_ERR(pp->shutdown_gpio));
-		return PTR_ERR(pp->shutdown_gpio);
+		ret = PTR_ERR(pp->shutdown_gpio);
+		dev_err(&pdev->dev, "cannot get shtdn-gpios (%d)\n", ret);
+		return ret;
 	}
-	pp->rs485sel_gpio = devm_gpiod_get(&pdev->dev, "rs485_rs232", GPIOD_OUT_LOW);
+	pp->rs485sel_gpio = devm_gpiod_get_optional(&pdev->dev, "rs485_rs232", GPIOD_OUT_LOW);
 	if (IS_ERR(pp->rs485sel_gpio)) {
-		dev_err(&pdev->dev, "cannot get rs485_rs232-gpios %ld\n",
-			PTR_ERR(pp->rs485sel_gpio));
-		return PTR_ERR(pp->rs485sel_gpio);
+		ret = PTR_ERR(pp->rs485sel_gpio);
+		dev_err(&pdev->dev, "cannot get rs485_rs232-gpios (%d)\n", ret);
+		return ret;
 	}
 
 	platform_set_drvdata(pdev, port);

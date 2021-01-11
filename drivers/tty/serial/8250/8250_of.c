@@ -16,6 +16,8 @@
 #include <linux/pm_runtime.h>
 #include <linux/clk.h>
 #include <linux/reset.h>
+#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 
 #include "8250.h"
 
@@ -24,6 +26,11 @@ struct of_serial_info {
 	struct reset_control *rst;
 	int type;
 	int line;
+};
+
+struct of_serial_gpios {
+	struct gpio_desc *shutdown_gpio; /* Shutdown gpio used with MAX3160CAP */
+	struct gpio_desc *rs485sel_gpio; /* Gpio to select elettrical interface used with MAX3160CAP */
 };
 
 #ifdef CONFIG_ARCH_TEGRA
@@ -47,6 +54,41 @@ static inline void tegra_serial_handle_break(struct uart_port *port)
 {
 }
 #endif
+
+/* Function called when change the eletrical configuration of the serial port */
+static int of_platform_serial_config_rs485(struct uart_port *port, struct serial_rs485 *rs485conf)
+{
+    struct of_serial_gpios *portGPIOs = (struct of_serial_gpios *) port->private_data;
+	if (!portGPIOs) {
+		/* the struct should always be available! instead, its optional GPIOs should be NULL */
+		dev_err(port->dev, "private_data not set up\n");
+		return -EINVAL;
+	}
+
+	/* 
+	 * NOTE: the following gpiod_set_value calls on 
+	 * optional GPIOs, will not produce any effect
+	 * if the GPIOs are not present.
+	 * So, don't care about NULL here.
+	 */
+
+	/* Disable MAX3160CAP outputs */
+	gpiod_set_value(portGPIOs->shutdown_gpio, 0);
+
+	/* change eletrical state */
+	if (rs485conf->flags & SER_RS485_ENABLED) {
+		dev_dbg(port->dev, "Setting UART to RS485\n");
+		gpiod_set_value(portGPIOs->rs485sel_gpio, 1);
+	} else {
+		dev_dbg(port->dev, "Setting UART to RS232\n");
+		gpiod_set_value(portGPIOs->rs485sel_gpio, 0);
+	}
+
+	/* Enable MAX3160CAP outputs */
+	gpiod_set_value(portGPIOs->shutdown_gpio, 1);
+
+	return 0;
+}
 
 /*
  * Fill a struct uart_port for a given device node
@@ -212,6 +254,11 @@ static int of_platform_serial_probe(struct platform_device *ofdev)
 	unsigned int port_type;
 	u32 tx_threshold;
 	int ret;
+	struct of_serial_gpios *portGPIOs;
+
+	portGPIOs = devm_kzalloc(&ofdev->dev, sizeof(*portGPIOs), GFP_KERNEL);
+	if (portGPIOs == NULL)
+		return -ENOMEM;
 
 	port_type = (unsigned long)of_device_get_match_data(&ofdev->dev);
 	if (port_type == PORT_UNKNOWN)
@@ -245,6 +292,22 @@ static int of_platform_serial_probe(struct platform_device *ofdev)
 			"overrun-throttle-ms",
 			&port8250.overrun_backoff_time_ms) != 0)
 		port8250.overrun_backoff_time_ms = 0;
+
+	/* Read custom GPIOs - used to pilot MAX3160CAP */
+	portGPIOs->shutdown_gpio = devm_gpiod_get_optional(&ofdev->dev, "shtdn", GPIOD_OUT_HIGH);
+	if (IS_ERR(portGPIOs->shutdown_gpio)) {
+		ret = PTR_ERR(portGPIOs->shutdown_gpio);
+		dev_err(&ofdev->dev, "cannot get shtdn-gpios (%d)\n", ret);
+		goto err_dispose;
+	}
+	portGPIOs->rs485sel_gpio = devm_gpiod_get_optional(&ofdev->dev, "rs485_rs232", GPIOD_OUT_LOW);
+	if (IS_ERR(portGPIOs->rs485sel_gpio)) {
+		ret = PTR_ERR(portGPIOs->rs485sel_gpio);
+		dev_err(&ofdev->dev, "cannot get rs485_rs232-gpios (%d)\n", ret);
+		goto err_dispose;
+	}
+	port8250.port.private_data = (void *)portGPIOs;
+	port8250.port.rs485_config = of_platform_serial_config_rs485;
 
 	ret = serial8250_register_8250_port(&port8250);
 	if (ret < 0)
