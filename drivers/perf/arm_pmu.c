@@ -243,6 +243,10 @@ armpmu_del(struct perf_event *event, int flags)
 	perf_event_update_userpage(event);
 	/* Clear the allocated counter */
 	hwc->idx = -1;
+
+	if (armpmu->stop_cti) {
+		armpmu->stop_cti(armpmu->plat_device);
+	}
 }
 
 static int
@@ -269,6 +273,10 @@ armpmu_add(struct perf_event *event, int flags)
 	event->hw.idx = idx;
 	armpmu->disable(event);
 	hw_events->events[idx] = event;
+
+	if (armpmu->start_cti) {
+		armpmu->start_cti(armpmu->plat_device);
+	}
 
 	hwc->state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
 	if (flags & PERF_EF_START)
@@ -350,6 +358,8 @@ static irqreturn_t armpmu_dispatch_irq(int irq, void *dev)
 		return IRQ_NONE;
 
 	start_clock = sched_clock();
+	if (armpmu->handler_cti)
+		armpmu->handler_cti(irq);
 	ret = armpmu->handle_irq(armpmu);
 	finish_clock = sched_clock();
 

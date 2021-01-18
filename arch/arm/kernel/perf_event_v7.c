@@ -29,6 +29,8 @@
 #include <linux/perf/arm_pmu.h>
 #include <linux/platform_device.h>
 
+#include "./socfpga_cti.h"
+
 /*
  * Common ARMv7 event types
  *
@@ -1212,12 +1214,16 @@ static int armv7_a8_pmu_init(struct arm_pmu *cpu_pmu)
 static int armv7_a9_pmu_init(struct arm_pmu *cpu_pmu)
 {
 	armv7pmu_init(cpu_pmu);
+	socfpga_init_cti(cpu_pmu->plat_device);
 	cpu_pmu->name		= "armv7_cortex_a9";
 	cpu_pmu->map_event	= armv7_a9_map_event;
 	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] =
 		&armv7_pmuv1_events_attr_group;
 	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] =
 		&armv7_pmu_format_attr_group;
+	cpu_pmu->start_cti = socfpga_start_cti;
+	cpu_pmu->stop_cti = socfpga_stop_cti;
+	cpu_pmu->handler_cti = socfpga_pmu_handler;
 	return armv7_probe_num_events(cpu_pmu);
 }
 
