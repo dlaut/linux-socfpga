@@ -111,6 +111,11 @@ struct arm_pmu {
 
 	/* Only to be used by ACPI probing code */
 	unsigned long acpi_cpuid;
+
+	/* CTI specific functions */
+	int (*start_cti)(struct platform_device *pdev);
+	int (*stop_cti)(struct platform_device *pdev);
+	irqreturn_t (*handler_cti)(int irq);
 };
 
 #define to_arm_pmu(p) (container_of(p, struct arm_pmu, pmu))
