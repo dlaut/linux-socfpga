@@ -37,6 +37,7 @@
 #include <linux/net_tstamp.h>
 #include <linux/phylink.h>
 #include <net/pkt_cls.h>
+#include <net/dsa.h>
 #include "stmmac_ptp.h"
 #include "stmmac.h"
 #include <linux/reset.h>
@@ -3529,9 +3530,13 @@ read_again:
 			 * llc_snap is never checked in GMAC >= 4, so this ACS
 			 * feature is always disabled and packets need to be
 			 * stripped manually.
+			 *
+			 * If DSA is enabled, ACS is not set and packets need to
+			 * be stripped manually.
 			 */
 			if (unlikely(priv->synopsys_id >= DWMAC_CORE_4_00) ||
-			    unlikely(status != llc_snap))
+			    unlikely(status != llc_snap) ||
+			    unlikely(netdev_uses_dsa(priv->dev)))
 				len -= ETH_FCS_LEN;
 		}
 
