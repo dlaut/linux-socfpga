@@ -162,6 +162,10 @@ void ksz_adjust_link(struct dsa_switch *ds, int port,
 		     struct phy_device *phydev);
 int ksz_sset_count(struct dsa_switch *ds, int port, int sset);
 void ksz_get_ethtool_stats(struct dsa_switch *ds, int port, uint64_t *buf);
+int ksz_get_ts_info(struct dsa_switch *ds, int port,
+		    struct ethtool_ts_info *ts);
+int ksz_port_hwtstamp_get(struct dsa_switch *ds, int port, struct ifreq *ifr);
+int ksz_port_hwtstamp_set(struct dsa_switch *ds, int port, struct ifreq *ifr);
 int ksz_port_bridge_join(struct dsa_switch *ds, int port,
 			 struct net_device *br);
 void ksz_port_bridge_leave(struct dsa_switch *ds, int port,
