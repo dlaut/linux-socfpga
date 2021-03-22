@@ -11,6 +11,7 @@
 #include <linux/regmap.h>
 #include <linux/tty.h>
 #include <linux/printk.h>
+#include <linux/delay.h>
 
 #include "ksz8.h"
 #include "ksz_common.h"
@@ -428,10 +429,10 @@ static void ksz8863_pcp_close_tty(struct ksz_device *ksz_dev)
  */
 static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 {
+	int ret;
 	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
 	const u8 message[] = {0x0E, 0x0B, 0x0C, 0xDA};
 	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
-	int ret;
 
 	if (unlikely(!ldisc))
 	{
@@ -442,6 +443,32 @@ static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 	ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
 
 	tty_ldisc_deref(ldisc);
+
+	return ret;
+}
+
+/**
+ * Disable the autodetection mode on the EBC Connection Box
+ */
+static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
+{
+	int ret;
+	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	const u8 message = 0x08;
+	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
+
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	ret = ksz8863_pcp_do_write(pcp, ldisc, &message, sizeof(message));
+
+	tty_ldisc_deref(ldisc);
+
+	// Wait for reset completion
+	msleep(1);
 
 	return ret;
 }
@@ -470,6 +497,10 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 		return ret;
 
 	ret = ksz8863_pcp_disable_autodetect(ksz_dev);
+	if (unlikely(ret))
+		return ret;
+
+	ret = ksz8863_pcp_reset_cpld(ksz_dev);
 	if (unlikely(ret))
 		return ret;
 
