@@ -25,6 +25,7 @@
 #define KSZ8863_WRITE_SWITCH_COMMAND	0x2
 #define KSZ8863_READ_SWITCH_COMMAND	0x3
 #define KSZ8863_COMMAND_HEADER_SIZE	sizeof(u8) + sizeof(u8)	// command + reg address
+#define KSZ8863_SEND_RETRIES		3
 
 
 /*****************************************************************************/
@@ -97,6 +98,47 @@ static int ksz8863_pcp_do_read(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc,
 	return ret;
 }
 
+/**
+ * Send a PCP command which expects a response with a locked line discipline
+ */
+static int ksz8863_pcp_send_command(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc,
+				    u8 *cmd, size_t count)
+{
+	int ret, n_retries;
+	bool done;
+	u8 *resp = kmalloc(count, GFP_KERNEL);
+	if (unlikely(!resp))
+	{
+		dev_err(pcp->dev, "%s: Unable to allocate buffer", __FUNCTION__);
+		return -ENOMEM;
+	}
+
+	// Retransmit command if it fails
+	for (n_retries = 0, done = false; !done && n_retries < KSZ8863_SEND_RETRIES; ++n_retries)
+	{
+		// Send cmd request
+		ret = ksz8863_pcp_do_write(pcp, ldisc, cmd, count);
+		if (ret)
+			continue;
+
+		// Read response
+		ret = ksz8863_pcp_do_read(pcp, ldisc, resp, count);
+		if (ret)
+			continue;
+
+		done = true;
+	}
+
+	if (likely(done))
+	{
+		// Copy response to cmd buffer
+		memcpy(cmd, resp, count);
+	}
+	kfree(resp);
+
+	return ret;
+}
+
 static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 			    void *val_buf, size_t val_len)
 {
@@ -133,19 +175,13 @@ static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 		goto free_buff;
 	}
 
-	// Send read request
-	ret = ksz8863_pcp_do_write(pcp, ldisc, buff, buffer_size);
-	if (ret)
-		goto ldisc_deref;
+	ret = ksz8863_pcp_send_command(pcp, ldisc, buff, buffer_size);
 
-	// Read response
-	ret = ksz8863_pcp_do_read(pcp, ldisc, buff, buffer_size);
 	if (ret)
 		goto ldisc_deref;
 
 	// Copy to output buffer, excluding the header (0x0 0x0)
 	memcpy(val, buff + KSZ8863_COMMAND_HEADER_SIZE, val_len);
-	ret = 0;
 
   ldisc_deref:
 	tty_ldisc_deref(ldisc);
@@ -193,15 +229,9 @@ static int ksz8863_pcp_write(void *ctx, const void *data, size_t count)
 		goto free_buff;
 	}
 
-	// Write message
-	ret = ksz8863_pcp_do_write(pcp, ldisc, write_buf, write_size);
-	if (ret)
-		goto unlock_ldisc;
+	// Send write command and discard response
+	ret = ksz8863_pcp_send_command(pcp, ldisc, write_buf, write_size);
 
-	// Read and discard response
-	ret = ksz8863_pcp_do_read(pcp, ldisc, write_buf, write_size);
-
-  unlock_ldisc:
 	tty_ldisc_deref(ldisc);
 
   free_buff:
