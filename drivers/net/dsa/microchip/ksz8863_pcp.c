@@ -6,6 +6,7 @@
 
 #include "linux/compiler.h"
 #include "linux/kernel.h"
+#include <linux/reboot.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -24,6 +25,7 @@
 
 #define KSZ8863_WRITE_SWITCH_COMMAND	0x2
 #define KSZ8863_READ_SWITCH_COMMAND	0x3
+#define KSZ8863_AUTODETECTION_MSG_BYTE	0xC1
 #define KSZ8863_COMMAND_HEADER_SIZE	sizeof(u8) + sizeof(u8)	// command + reg address
 #define KSZ8863_SEND_RETRIES		3
 
@@ -51,6 +53,20 @@ static inline void get_termios(struct tty_struct *tty,
 	down_read(&tty->termios_rwsem);
 	*out_termios = tty->termios;
 	up_read(&tty->termios_rwsem);
+}
+
+/**
+ * Check if the latest message is an autodetection message and reboot
+ * the whole system if that is the case.
+ */
+static void check_for_autodetection_msg(u8 *buf, size_t count)
+{
+	const u8 message[] = {0xC1, 0xA0, 0xEB, 0xC0};
+
+	if (unlikely(memcmp(buf, message, count < sizeof(message) ? count : sizeof(message)) == 0))
+	{
+		kernel_restart("EBC Autodetection message received. Restarting system.");
+	}
 }
 
 
@@ -87,6 +103,10 @@ static int ksz8863_pcp_do_read(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc,
 	int ret;
 
 	ret = ldisc->ops->read(pcp->tty, NULL, buf, count);
+	if (likely(ret > 0))
+	{
+		check_for_autodetection_msg(buf, count);
+	}
 	if (unlikely(ret != count))
 	{
 		dev_err(dev, "%s: Unable to read response (%d != %d)", __FUNCTION__, ret, count);
