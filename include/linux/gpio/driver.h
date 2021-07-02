@@ -660,6 +660,8 @@ int gpiochip_generic_request(struct gpio_chip *chip, unsigned offset);
 void gpiochip_generic_free(struct gpio_chip *chip, unsigned offset);
 int gpiochip_generic_config(struct gpio_chip *chip, unsigned offset,
 			    unsigned long config);
+int gpiochip_generic_get_config(struct gpio_chip *chip, unsigned offset,
+				unsigned long *config);
 
 /**
  * struct gpio_pin_range - pin range controlled by a gpio chip
