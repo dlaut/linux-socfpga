@@ -2529,6 +2529,19 @@ int gpiochip_generic_config(struct gpio_chip *chip, unsigned offset,
 }
 EXPORT_SYMBOL_GPL(gpiochip_generic_config);
 
+/**
+ * gpiochip_generic_get_config() - get configuration of a pin
+ * @chip: the gpiochip owning the GPIO
+ * @offset: the offset of the GPIO to get the configuration
+ * @config: the resulting configuration
+ */
+int gpiochip_generic_get_config(struct gpio_chip *chip, unsigned offset,
+				unsigned long *config)
+{
+	return pinctrl_gpio_get_config(chip->gpiodev->base + offset, config);
+}
+EXPORT_SYMBOL_GPL(gpiochip_generic_get_config);
+
 #ifdef CONFIG_PINCTRL
 
 /**
