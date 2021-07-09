@@ -13,6 +13,7 @@
 #include <linux/tty.h>
 #include <linux/printk.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 
 #include "ksz8.h"
 #include "ksz_common.h"
@@ -25,9 +26,9 @@
 
 #define KSZ8863_WRITE_SWITCH_COMMAND	0x2
 #define KSZ8863_READ_SWITCH_COMMAND	0x3
-#define KSZ8863_AUTODETECTION_MSG_BYTE	0xC1
 #define KSZ8863_COMMAND_HEADER_SIZE	sizeof(u8) + sizeof(u8)	// command + reg address
 #define KSZ8863_SEND_RETRIES		3
+#define KSZ8863_DETECT_RETRIES		6
 
 
 /*****************************************************************************/
@@ -39,6 +40,13 @@ struct ksz8863_pcp
 	struct device           *dev;	// Associated device
 	struct tty_struct	*tty;	// TTY used for PCP communication
 };
+
+
+/*****************************************************************************/
+/*                              Local variables                              */
+/*****************************************************************************/
+
+static const u8 autodetection_message[] = {0xC1, 0xA0, 0xEB, 0xC0};
 
 
 /*****************************************************************************/
@@ -56,14 +64,21 @@ static inline void get_termios(struct tty_struct *tty,
 }
 
 /**
+ * Returns true if the message contained in buf is a (part of)
+ * autodetection message.
+ */
+static bool is_autodetection_msg(u8 *buf, size_t count)
+{
+	return memcmp(buf, autodetection_message, count < sizeof(autodetection_message) ? count : sizeof(autodetection_message)) == 0;
+}
+
+/**
  * Check if the latest message is an autodetection message and reboot
  * the whole system if that is the case.
  */
 static void check_for_autodetection_msg(u8 *buf, size_t count)
 {
-	const u8 message[] = {0xC1, 0xA0, 0xEB, 0xC0};
-
-	if (unlikely(memcmp(buf, message, count < sizeof(message) ? count : sizeof(message)) == 0))
+	if (unlikely(is_autodetection_msg(buf, count)))
 	{
 		kernel_restart("EBC Autodetection message received. Restarting system.");
 	}
@@ -393,6 +408,23 @@ static int __init ksz8863_pcp_init_private_data(struct platform_device *op)
 }
 
 /**
+ * Lock and close TTY (both kernel and user side). Used as devm action.
+ */
+static void ksz8863_pcp_close_tty(void *ptr)
+{
+	struct tty_struct *tty = ptr;
+
+	tty_lock(tty);
+
+	if (tty->ops->close)
+		tty->ops->close(tty, NULL);
+
+	tty_ldisc_flush(tty);
+	tty_unlock(tty);
+	tty_kclose(tty);
+}
+
+/**
  * Open TTY and set PCP ldisc.
  */
 static int __init ksz8863_pcp_init_tty(struct platform_device *op)
@@ -457,6 +489,11 @@ static int __init ksz8863_pcp_init_tty(struct platform_device *op)
 		return ret;
 	}
 
+	// Register cleanup function for managed resource unwinding
+	ret = devm_add_action_or_reset(pdev, ksz8863_pcp_close_tty, tty);
+	if (unlikely(ret))
+		dev_err(pdev, "(%s) Unable to add TTY close action", __FUNCTION__);
+
 	// Save TTY reference in private struct.
 	((struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv)->tty = tty;
 
@@ -466,20 +503,105 @@ static int __init ksz8863_pcp_init_tty(struct platform_device *op)
 }
 
 /**
- * Lock and close TTY (both kernel and user side)
+ * Listen to the autodetection message from EBC Connection Box
  */
-static void ksz8863_pcp_close_tty(struct ksz_device *ksz_dev)
+static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 {
-	struct tty_struct *tty = ((struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv)->tty;
+	int ret, n_retries;
+	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
+	u8 *buf;
+	size_t buf_size = sizeof(autodetection_message);
 
-	tty_lock(tty);
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
 
-	if (tty->ops->close)
-		tty->ops->close(tty, NULL);
+	buf = kmalloc(buf_size, GFP_KERNEL);
+	if (unlikely(!buf))
+	{
+		dev_err(pcp->dev, "%s: Unable to allocate buffer", __FUNCTION__);
+		tty_ldisc_deref(ldisc);
+		return -ENOMEM;
+	}
 
-	tty_ldisc_flush(tty);
-	tty_unlock(tty);
-	tty_kclose(tty);
+	// Read several times from TTY searching for autodetection msg
+	for (n_retries = 0; n_retries < KSZ8863_DETECT_RETRIES; ++n_retries)
+	{
+		ret = ldisc->ops->read(pcp->tty, NULL, buf, buf_size);
+		if (ret < 0)
+			continue;
+		if (ret == buf_size && is_autodetection_msg(buf, buf_size))
+		{
+			ret = 0;
+			dev_info(pcp->dev, "%s: EBC Connection Box found!", __FUNCTION__);
+			goto exit;
+		}
+	}
+
+	// Autodetection msg not found
+	ret = -ENODEV;
+	dev_err(pcp->dev, "%s: EBC Connection Box not found", __FUNCTION__);
+
+  exit:
+	tty_ldisc_deref(ldisc);
+	kfree(buf);
+	return ret;
+}
+
+/**
+ * Reset an output GPIO value to 0. Used as devm action.
+ */
+static void ksz8863_pcp_reset_gpio(void *ptr)
+{
+	struct gpio_desc *gpio = ptr;
+
+	gpiod_set_value_cansleep(gpio, 0);
+}
+
+/**
+ * Get an output GPIO and set its value to 1. Reset its value on exit.
+ */
+static int ksz8863_pcp_init_gpio(struct device *dev, const char *gpio_name)
+{
+	struct gpio_desc *gpio = devm_gpiod_get(dev, gpio_name, GPIOD_OUT_HIGH);
+	int err;
+
+	if (unlikely(IS_ERR(gpio)))
+	{
+		dev_err(dev, "%s: Failed to retrieve %s GPIO", __FUNCTION__, gpio_name);
+		return PTR_ERR(gpio);
+	}
+
+	// Register cleanup function for managed resource unwinding
+	err = devm_add_action_or_reset(dev, ksz8863_pcp_reset_gpio, gpio);
+	if (unlikely(err))
+		dev_err(dev, "(%s) Unable to add %s GPIO restore action", __FUNCTION__, gpio_name);
+
+	return err;
+}
+
+/**
+ * Get all GPIO references and set them
+ */
+static int ksz8863_pcp_init_gpios(struct platform_device *op)
+{
+	struct device *pdev = &op->dev;
+	int ret;
+
+	ret = ksz8863_pcp_init_gpio(pdev, "alive");
+	if (unlikely(ret))
+		return ret;
+	ret = ksz8863_pcp_init_gpio(pdev, "comm-enable");
+	if (unlikely(ret))
+		return ret;
+
+	// Wait a bit to be sure that the GPIO transitions are sampled
+	msleep(10);
+
+	return 0;
 }
 
 /**
@@ -553,6 +675,14 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 	if (unlikely(ret))
 		return ret;
 
+	ret = ksz8863_pcp_detect_ebc(ksz_dev);
+	if (unlikely(ret))
+		return ret;
+
+	ret = ksz8863_pcp_init_gpios(op);
+	if (unlikely(ret))
+		return ret;
+
 	ret = ksz8863_pcp_disable_autodetect(ksz_dev);
 	if (unlikely(ret))
 		return ret;
@@ -566,7 +696,6 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 	if (ret)
 	{
 		dev_err(pdev, "%s: Unable to register switch device", __FUNCTION__);
-		ksz8863_pcp_close_tty(ksz_dev);
 		return ret;
 	}
 
@@ -580,8 +709,6 @@ static int ksz8863_pcp_remove(struct platform_device *op)
 	struct ksz_device *ksz_dev = platform_get_drvdata(op);
 
 	ksz_switch_remove(ksz_dev);
-
-	ksz8863_pcp_close_tty(ksz_dev);
 
 	return 0;
 }
