@@ -530,7 +530,9 @@ static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 	// Read several times from TTY searching for autodetection msg
 	for (n_retries = 0; n_retries < KSZ8863_DETECT_RETRIES; ++n_retries)
 	{
+		dev_dbg(pcp->dev, "%s: retry = %d", __FUNCTION__, n_retries);
 		ret = ldisc->ops->read(pcp->tty, NULL, buf, buf_size);
+		dev_dbg(pcp->dev, "%s: read returned %d", __FUNCTION__, ret);
 		if (ret < 0)
 			continue;
 		if (ret == buf_size && is_autodetection_msg(buf, buf_size))
@@ -648,7 +650,7 @@ static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
 	tty_ldisc_deref(ldisc);
 
 	// Wait for reset completion
-	msleep(1);
+	msleep(10);
 
 	return ret;
 }
@@ -750,3 +752,7 @@ module_platform_driver_probe(_platform_driver, ksz8863_pcp_probe);
 MODULE_AUTHOR("Filippo Franzoni <filippo.franzoni@datalogic.com>");
 MODULE_DESCRIPTION("Microchip KSZ8863 PCP Switch driver");
 MODULE_LICENSE("GPL v2");
+MODULE_SOFTDEP("pre: pcp_ldisc digitalIOManager");
+MODULE_INFO(dl_tag, "kernel");
+MODULE_INFO(dl_tag, "fpga");
+MODULE_INFO(dl_tag, "ebc");
