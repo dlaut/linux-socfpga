@@ -653,6 +653,18 @@ static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
 	return ret;
 }
 
+/**
+ * Perform a dummy read on a switch register because the first read
+ * always returns 0.
+ */
+static int __init ksz8863_pcp_dummy_read(struct ksz_device *ksz_dev)
+{
+	u8 reg = 0;
+	u8 val;
+
+	return ksz8863_pcp_read(ksz_dev, &reg, sizeof(reg), &val, sizeof(val));
+}
+
 static int __init ksz8863_pcp_probe(struct platform_device *op)
 {
 	struct device *pdev = &op->dev;
@@ -688,6 +700,10 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 		return ret;
 
 	ret = ksz8863_pcp_reset_cpld(ksz_dev);
+	if (unlikely(ret))
+		return ret;
+
+	ret = ksz8863_pcp_dummy_read(ksz_dev);
 	if (unlikely(ret))
 		return ret;
 
