@@ -25,11 +25,35 @@
 /*                                 Constants                                 */
 /*****************************************************************************/
 
+/* Commands ******************************************************************/
 #define KSZ8863_WRITE_SWITCH_COMMAND	0x2
 #define KSZ8863_READ_SWITCH_COMMAND	0x3
+#define KSZ8863_QUERY_VERSION_COMMAND	0x4
+#define KSZ8863_RESET_CPLD_COMMAND	0x8
+#define KSZ8863_FLASH_RW_COMMAND	0x80
+#define KSZ8863_FLASH_RESET_COMMAND	0x90
+
+/* Messages ******************************************************************/
+#define KSZ8863_ISC_ENABLE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x74, 0x8, 0, 0}
+#define KSZ8863_LSC_INIT_ADDR_NVCM1_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x47, 0, 0, 0}
+#define KSZ8863_LSC_READ_TAG_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xCA, 0, 0, 0x1}
+#define KSZ8863_ISC_DISABLE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x26, 0, 0}
+#define KSZ8863_NOOP_MESSAGE			{KSZ8863_FLASH_RW_COMMAND, 0xFF}
+#define KSZ8863_ISC_ERASE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x0E, 0x08, 0x00, 0x00}
+#define KSZ8863_LSC_CHECK_BUSY_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xF0, 0x00, 0x00, 0x00}
+#define KSZ8863_LSC_PROG_TAG_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xC9, 0x00, 0x00, 0x01}
+
+/* Serial Number *************************************************************/
+#define KSZ8863_SN_LENGTH		9
+#define KSZ8863_SN_N_PAGES		3
+#define KSZ8863_SN_BYTES_PER_PAGE	3
+#define KSZ8863_FLASH_PAGE_BYTES	4
+
+/* Other *********************************************************************/
 #define KSZ8863_COMMAND_HEADER_SIZE	sizeof(u8) + sizeof(u8)	// command + reg address
 #define KSZ8863_SEND_RETRIES		3
 #define KSZ8863_DETECT_RETRIES		6
+#define KSZ8863_CHECK_BUSY_RETRIES	20
 
 
 /*****************************************************************************/
@@ -98,6 +122,14 @@ static void check_for_autodetection_msg(u8 *buf, size_t count)
 	{
 		kernel_restart("EBC Autodetection message received. Restarting system.");
 	}
+}
+
+/**
+ * Get ksz8863_pcp struct stored in ksz_device priv data.
+ */
+static struct ksz8863_pcp* to_ksz8863_pcp_struct(struct ksz_device *ksz_dev)
+{
+	return (struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv;
 }
 
 
@@ -194,7 +226,7 @@ static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 			    void *val_buf, size_t val_len)
 {
 	struct ksz_device *ksz_dev = (struct ksz_device *)ctx;
-	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
 	struct device * dev = pcp->dev;
 	struct tty_ldisc *ldisc;
 
@@ -245,7 +277,7 @@ static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 static int ksz8863_pcp_write(void *ctx, const void *data, size_t count)
 {
 	struct ksz_device *ksz_dev = (struct ksz_device *)ctx;
-	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
 	struct device * dev = pcp->dev;
 	struct tty_ldisc *ldisc;
 
@@ -348,11 +380,323 @@ static const struct regmap_config ksz8863_regmap_pcp_config[] = {
 };
 
 
+/* Sysfs functions ***********************************************************/
+
+ssize_t serial_number_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	ssize_t ret;
+	int i;
+	u8 serial_number[KSZ8863_SN_LENGTH + 1]; // Includes string terminator
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
+
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	// Reset Wishbone Bus
+	{
+		const u8 message = KSZ8863_FLASH_RESET_COMMAND;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, &message, sizeof(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	// Enable configuration interface in transparent mode
+	{
+		const u8 message[] = KSZ8863_ISC_ENABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	udelay(5);
+
+	// Set AREA1 (UFM) Address
+	{
+		const u8 message[] = KSZ8863_LSC_INIT_ADDR_NVCM1_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	udelay(5);
+
+	// Read Serial Number written on several pages
+	for (i = 0; i < KSZ8863_SN_N_PAGES; ++i)
+	{
+		u8 rcv_buf[KSZ8863_FLASH_PAGE_BYTES];
+		const u8 message[] = KSZ8863_LSC_READ_TAG_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+		if (ret)
+			goto ldisc_deref;
+		ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+		if (ret)
+			goto ldisc_deref;
+
+		// Fill serial number bytes
+		memcpy(serial_number+(i*KSZ8863_SN_BYTES_PER_PAGE), rcv_buf, KSZ8863_SN_BYTES_PER_PAGE);
+
+		usleep_range(200, 500);
+	}
+	serial_number[KSZ8863_SN_LENGTH] = '\0'; // Terminate string
+
+	// Disable
+	{
+		u8 message[] = KSZ8863_ISC_DISABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	// NOOP
+	{
+		u8 message[] = KSZ8863_NOOP_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	ret = snprintf(buf, PAGE_SIZE, "%s\n", serial_number);
+
+  ldisc_deref:
+	release_tty_ldisc(pcp, ldisc);
+
+	return ret;
+}
+
+ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t len)
+{
+	ssize_t ret;
+	int i;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
+	struct tty_ldisc *ldisc;
+
+	// Precondition: input buffer length must be the same of serial number length
+	if (len != KSZ8863_SN_LENGTH)
+	{
+		dev_err(pcp->dev, "%s: Invalid input length (%d != %d)", __FUNCTION__, len, KSZ8863_SN_LENGTH);
+		return -EINVAL;
+	}
+
+	ldisc = get_tty_ldisc(pcp);
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	// Reset Wishbone Bus
+	{
+		const u8 message = KSZ8863_FLASH_RESET_COMMAND;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, &message, sizeof(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Enable configuration interface in transparent mode
+	{
+		const u8 message[] = KSZ8863_ISC_ENABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Erase UFM
+	{
+		const u8 message[] = KSZ8863_ISC_ERASE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	// Sleep for a bit waiting for UFM erasure completion.
+	// NOTE: Keep the line discipline locked because data cannot
+	// be transfered during erasure procedure.
+	msleep(700);
+
+	// Check busy until it is ready
+	{
+		const u8 message[] = KSZ8863_LSC_CHECK_BUSY_MESSAGE;
+		u8 rcv_buf[4];
+		bool busy;
+		do
+		{
+			ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+			if (ret)
+				goto ldisc_deref;
+			ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+			if (ret)
+				goto ldisc_deref;
+
+			busy = rcv_buf[0] != 0;
+
+			usleep_range(2000, 4000);
+		} while (busy);
+	}
+
+	// Set AREA1 (UFM) Address
+	{
+		const u8 message[] = KSZ8863_LSC_INIT_ADDR_NVCM1_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Write Serial number in the Flash AREA1 (User Flash Memory)
+	for (i = 0; i < KSZ8863_SN_N_PAGES; ++i)
+	{
+		u8 prog_message[21] = KSZ8863_LSC_PROG_TAG_MESSAGE;
+		const u8 check_busy_message[] = KSZ8863_LSC_CHECK_BUSY_MESSAGE;
+		u8 rcv_buf[4];
+		int j;
+		bool busy;
+
+		// Fill serial number bytes
+		memcpy(prog_message + 5, buf + (i * KSZ8863_SN_BYTES_PER_PAGE), KSZ8863_SN_BYTES_PER_PAGE);
+
+		ret = ksz8863_pcp_do_write(pcp, ldisc, prog_message, ARRAY_SIZE(prog_message));
+		if (ret)
+			goto ldisc_deref;
+		ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+		if (ret)
+			goto ldisc_deref;
+
+		usleep_range(100, 200);
+
+		// Check busy for several times. If not ready, abort.
+		for (j = 0, busy = true; j < KSZ8863_CHECK_BUSY_RETRIES && busy; ++j)
+		{
+			ret = ksz8863_pcp_do_write(pcp, ldisc, check_busy_message, ARRAY_SIZE(check_busy_message));
+			if (ret)
+				goto ldisc_deref;
+			ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+			if (ret)
+				goto ldisc_deref;
+
+			busy = rcv_buf[0] != 0;
+
+			usleep_range(2000, 4000);
+		}
+		if (busy)
+		{
+			dev_err(pcp->dev, "%s: Stuck in busy condition. Abort.", __FUNCTION__);
+			ret = -EBUSY;
+			goto ldisc_deref;
+		}
+	}
+
+	// Set AREA1 (UFM) Address
+	{
+		const u8 message[] = KSZ8863_LSC_INIT_ADDR_NVCM1_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Verify if the serial number has been correctly stored
+	for (i = 0; i < KSZ8863_SN_N_PAGES; ++i)
+	{
+		u8 rcv_buf[KSZ8863_FLASH_PAGE_BYTES];
+		const u8 message[] = KSZ8863_LSC_READ_TAG_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+		if (ret)
+			goto ldisc_deref;
+		ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+		if (ret)
+			goto ldisc_deref;
+
+		// Compare with input buffer
+		if (memcmp(rcv_buf, buf + (i*KSZ8863_SN_BYTES_PER_PAGE), KSZ8863_SN_BYTES_PER_PAGE) != 0)
+		{
+			dev_err(pcp->dev, "%s: Stored serial number verification failed.", __FUNCTION__);
+			ret = -EIO;
+			goto ldisc_deref;
+		}
+
+		usleep_range(200, 500);
+	}
+
+	// Disable
+	{
+		u8 message[] = KSZ8863_ISC_DISABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// NOOP
+	{
+		u8 message[] = KSZ8863_NOOP_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (ret)
+		goto ldisc_deref;
+
+	// Success: return full write size even if we didn't consume all
+	ret = len;
+
+  ldisc_deref:
+	release_tty_ldisc(pcp, ldisc);
+
+	return ret;
+}
+
+static DEVICE_ATTR_RW(serial_number);
+
+ssize_t cpld_version_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	ssize_t ret;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
+	u8 message[] = {KSZ8863_QUERY_VERSION_COMMAND, 0, 0, 0};
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
+
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	ret = ksz8863_pcp_send_command(pcp, ldisc, message, ARRAY_SIZE(message));
+	if (ret)
+		goto ldisc_deref;
+
+	ret = snprintf(buf, PAGE_SIZE, "%d.%d.%d\n", message[1], message[2], message[3]);
+
+  ldisc_deref:
+	release_tty_ldisc(pcp, ldisc);
+
+	return ret;
+}
+
+static DEVICE_ATTR_RO(cpld_version);
+
+static struct attribute *ksz8863_attrs[] = {
+	&dev_attr_serial_number.attr,
+	&dev_attr_cpld_version.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ksz8863);
+
+
 /* Platform device functions *************************************************/
 
 static int __init ksz8863_pcp_init_regmap(struct ksz_device *ksz_dev)
 {
-	struct device *dev = ((struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv)->dev;
+	struct device *dev = to_ksz8863_pcp_struct(ksz_dev)->dev;
 	struct regmap_config rc;
 	int ret, i;
 
@@ -514,7 +858,7 @@ static int __init ksz8863_pcp_init_tty(struct platform_device *op)
 		dev_err(pdev, "(%s) Unable to add TTY close action", __FUNCTION__);
 
 	// Save TTY reference in private struct.
-	((struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv)->tty = tty;
+	to_ksz8863_pcp_struct(ksz_dev)->tty = tty;
 
 	dev_dbg(pdev, "%s: end", __FUNCTION__);
 
@@ -527,7 +871,7 @@ static int __init ksz8863_pcp_init_tty(struct platform_device *op)
 static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 {
 	int ret, n_retries;
-	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
 	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 	u8 *buf;
 	size_t buf_size = sizeof(autodetection_message);
@@ -631,7 +975,7 @@ static int ksz8863_pcp_init_gpios(struct platform_device *op)
 static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 {
 	int ret;
-	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
 	const u8 message[] = {0x0E, 0x0B, 0x0C, 0xDA};
 	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 
@@ -654,8 +998,8 @@ static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
 {
 	int ret;
-	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
-	const u8 message = 0x08;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
+	const u8 message = KSZ8863_RESET_CPLD_COMMAND;
 	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 
 	if (unlikely(!ldisc))
@@ -684,6 +1028,21 @@ static int __init ksz8863_pcp_dummy_read(struct ksz_device *ksz_dev)
 	u8 val;
 
 	return ksz8863_pcp_read(ksz_dev, &reg, sizeof(reg), &val, sizeof(val));
+}
+
+/**
+ * Initialize sysfs files.
+ */
+static int __init ksz8863_pcp_init_sysfs(struct ksz_device *ksz_dev)
+{
+	struct device *dev = to_ksz8863_pcp_struct(ksz_dev)->dev;
+	int ret = devm_device_add_groups(dev, ksz8863_groups);
+	if (unlikely(ret))
+	{
+		dev_err(dev, "Unable to add sysfs groups");
+	}
+
+	return ret;
 }
 
 static int __init ksz8863_pcp_probe(struct platform_device *op)
@@ -725,6 +1084,10 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 		return ret;
 
 	ret = ksz8863_pcp_dummy_read(ksz_dev);
+	if (unlikely(ret))
+		return ret;
+
+	ret = ksz8863_pcp_init_sysfs(ksz_dev);
 	if (unlikely(ret))
 		return ret;
 
