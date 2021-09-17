@@ -6,6 +6,7 @@
 
 #include "linux/compiler.h"
 #include "linux/kernel.h"
+#include <linux/mutex.h>
 #include <linux/reboot.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
@@ -39,6 +40,7 @@ struct ksz8863_pcp
 {
 	struct device           *dev;	// Associated device
 	struct tty_struct	*tty;	// TTY used for PCP communication
+	struct mutex 		lock;	// Lock for TTY line discipline
 };
 
 
@@ -61,6 +63,20 @@ static inline void get_termios(struct tty_struct *tty,
 	down_read(&tty->termios_rwsem);
 	*out_termios = tty->termios;
 	up_read(&tty->termios_rwsem);
+}
+
+static struct tty_ldisc * get_tty_ldisc(struct ksz8863_pcp *pcp)
+{
+	struct tty_ldisc * ldisc = tty_ldisc_ref(pcp->tty);
+	if (ldisc)
+		mutex_lock(&pcp->lock);
+	return ldisc;
+}
+
+static void release_tty_ldisc(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc)
+{
+	mutex_unlock(&pcp->lock);
+	tty_ldisc_deref(ldisc);
 }
 
 /**
@@ -202,7 +218,7 @@ static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 	buff[1] = reg;
 
 	// Lock line discipline
-	ldisc = tty_ldisc_ref(pcp->tty);
+	ldisc = get_tty_ldisc(pcp);
 	if (unlikely(!ldisc))
 	{
 		dev_err(dev, "%s: Unable to lock ldisc", __FUNCTION__);
@@ -219,7 +235,7 @@ static int ksz8863_pcp_read(void *ctx, const void *reg_buf, size_t reg_len,
 	memcpy(val, buff + KSZ8863_COMMAND_HEADER_SIZE, val_len);
 
   ldisc_deref:
-	tty_ldisc_deref(ldisc);
+	release_tty_ldisc(pcp, ldisc);
   free_buff:
 	kfree(buff);
 
@@ -256,7 +272,7 @@ static int ksz8863_pcp_write(void *ctx, const void *data, size_t count)
 	memcpy(&write_buf[2], val, count);
 
 	// Lock line discipline
-	ldisc = tty_ldisc_ref(pcp->tty);
+	ldisc = get_tty_ldisc(pcp);
 	if (unlikely(!ldisc))
 	{
 		dev_err(dev, "%s: Unable to lock ldisc", __FUNCTION__);
@@ -267,7 +283,7 @@ static int ksz8863_pcp_write(void *ctx, const void *data, size_t count)
 	// Send write command and discard response
 	ret = ksz8863_pcp_send_command(pcp, ldisc, write_buf, write_size);
 
-	tty_ldisc_deref(ldisc);
+	release_tty_ldisc(pcp, ldisc);
 
   free_buff:
 	kfree(write_buf);
@@ -389,6 +405,9 @@ static int __init ksz8863_pcp_init_private_data(struct platform_device *op)
 	// Set ksz8863_pcp as ksz8 private data
 	ksz8->priv = pcp;
 
+	// Initialize mutex
+	mutex_init(&pcp->lock);
+
 	// Allocate ksz device
 	ksz_dev = ksz_switch_alloc(&op->dev, ksz8);
 	if (unlikely(!ksz_dev))
@@ -509,7 +528,7 @@ static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 {
 	int ret, n_retries;
 	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
-	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 	u8 *buf;
 	size_t buf_size = sizeof(autodetection_message);
 
@@ -523,7 +542,7 @@ static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 	if (unlikely(!buf))
 	{
 		dev_err(pcp->dev, "%s: Unable to allocate buffer", __FUNCTION__);
-		tty_ldisc_deref(ldisc);
+		release_tty_ldisc(pcp, ldisc);
 		return -ENOMEM;
 	}
 
@@ -548,7 +567,7 @@ static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 	dev_err(pcp->dev, "%s: EBC Connection Box not found", __FUNCTION__);
 
   exit:
-	tty_ldisc_deref(ldisc);
+	release_tty_ldisc(pcp, ldisc);
 	kfree(buf);
 	return ret;
 }
@@ -614,7 +633,7 @@ static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 	int ret;
 	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
 	const u8 message[] = {0x0E, 0x0B, 0x0C, 0xDA};
-	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 
 	if (unlikely(!ldisc))
 	{
@@ -624,7 +643,7 @@ static int __init ksz8863_pcp_disable_autodetect(struct ksz_device *ksz_dev)
 
 	ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
 
-	tty_ldisc_deref(ldisc);
+	release_tty_ldisc(pcp, ldisc);
 
 	return ret;
 }
@@ -637,7 +656,7 @@ static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
 	int ret;
 	struct ksz8863_pcp *pcp = ((struct ksz8*)ksz_dev->priv)->priv;
 	const u8 message = 0x08;
-	struct tty_ldisc *ldisc = tty_ldisc_ref(pcp->tty);
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
 
 	if (unlikely(!ldisc))
 	{
@@ -647,7 +666,7 @@ static int __init ksz8863_pcp_reset_cpld(struct ksz_device *ksz_dev)
 
 	ret = ksz8863_pcp_do_write(pcp, ldisc, &message, sizeof(message));
 
-	tty_ldisc_deref(ldisc);
+	release_tty_ldisc(pcp, ldisc);
 
 	// Wait for reset completion
 	msleep(10);
