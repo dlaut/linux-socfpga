@@ -2079,7 +2079,7 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 			   unsigned int *data)
 {
 	struct ni_private *devpriv = dev->private;
-	unsigned int mask = (s->maxdata + 1) >> 1;
+	unsigned int mask = s->maxdata;
 	int i, n;
 	unsigned signbits;
 	unsigned int d;
@@ -2120,7 +2120,7 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 				return -ETIME;
 			}
 			d += signbits;
-			data[n] = d;
+			data[n] = d & 0xffff;
 		}
 	} else if (devpriv->is_6143) {
 		for (n = 0; n < insn->n; n++) {
@@ -2163,8 +2163,8 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 				data[n] = dl;
 			} else {
 				d = ni_readw(dev, ADC_FIFO_Data_Register);
-				d += signbits;	/* subtle: needs to be short addition */
-				data[n] = d;
+				d += signbits;
+				data[n] = d & 0xffff;
 			}
 		}
 	}

@@ -451,6 +451,10 @@ void __init parse_early_param(void)
  *	Activate the first processor.
  */
 
+#ifdef CONFIG_SMP
+int __boot_cpu_id;
+#endif
+
 static void __init boot_cpu_init(void)
 {
 	int cpu = smp_processor_id();
@@ -459,6 +463,10 @@ static void __init boot_cpu_init(void)
 	set_cpu_active(cpu, true);
 	set_cpu_present(cpu, true);
 	set_cpu_possible(cpu, true);
+
+#ifdef CONFIG_SMP
+	__boot_cpu_id = cpu;
+#endif
 }
 
 void __init __weak smp_setup_processor_id(void)
@@ -525,6 +533,7 @@ asmlinkage __visible void __init start_kernel(void)
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
+	softirq_early_init();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 
 	build_all_zonelists(NULL, NULL);

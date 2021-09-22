@@ -14,7 +14,9 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/percpu-refcount.h>
+#include <linux/percpu-rwsem.h>
 #include <linux/workqueue.h>
+#include <linux/work-simple.h>
 
 #ifdef CONFIG_CGROUPS
 
@@ -124,6 +126,7 @@ struct cgroup_subsys_state {
 	/* percpu_ref killing and RCU release */
 	struct rcu_head rcu_head;
 	struct work_struct destroy_work;
+	struct swork_event destroy_swork;
 };
 
 /*
@@ -466,5 +469,16 @@ struct cgroup_subsys {
 	unsigned int depends_on;
 };
 
+void cgroup_threadgroup_change_begin(struct task_struct *tsk);
+void cgroup_threadgroup_change_end(struct task_struct *tsk);
+
+#else	/* CONFIG_CGROUPS */
+
+#define CGROUP_SUBSYS_COUNT 0
+
+static inline void cgroup_threadgroup_change_begin(struct task_struct *tsk) {}
+static inline void cgroup_threadgroup_change_end(struct task_struct *tsk) {}
+
 #endif	/* CONFIG_CGROUPS */
+
 #endif	/* _LINUX_CGROUP_DEFS_H */

@@ -167,7 +167,9 @@ static void page_cache_tree_delete(struct address_space *mapping,
 	if (!workingset_node_pages(node) &&
 	    list_empty(&node->private_list)) {
 		node->private_data = mapping;
-		list_lru_add(&workingset_shadow_nodes, &node->private_list);
+		local_lock(workingset_shadow_lock);
+		list_lru_add(&__workingset_shadow_nodes, &node->private_list);
+		local_unlock(workingset_shadow_lock);
 	}
 }
 
@@ -533,9 +535,12 @@ static int page_cache_tree_insert(struct address_space *mapping,
 		 * node->private_list is protected by
 		 * mapping->tree_lock.
 		 */
-		if (!list_empty(&node->private_list))
-			list_lru_del(&workingset_shadow_nodes,
+		if (!list_empty(&node->private_list)) {
+			local_lock(workingset_shadow_lock);
+			list_lru_del(&__workingset_shadow_nodes,
 				     &node->private_list);
+			local_unlock(workingset_shadow_lock);
+		}
 	}
 	return 0;
 }
@@ -791,9 +796,12 @@ void page_endio(struct page *page, int rw, int err)
 		unlock_page(page);
 	} else { /* rw == WRITE */
 		if (err) {
+			struct address_space *mapping;
+
 			SetPageError(page);
-			if (page->mapping)
-				mapping_set_error(page->mapping, err);
+			mapping = page_mapping(page);
+			if (mapping)
+				mapping_set_error(mapping, err);
 		}
 		end_page_writeback(page);
 	}
@@ -1485,6 +1493,11 @@ static ssize_t do_generic_file_read(struct file *filp, loff_t *ppos,
 
 		cond_resched();
 find_page:
+		if (fatal_signal_pending(current)) {
+			error = -EINTR;
+			goto out;
+		}
+
 		page = find_get_page(mapping, index);
 		if (!page) {
 			page_cache_sync_readahead(mapping,
