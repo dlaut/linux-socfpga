@@ -39,3 +39,26 @@ config NET_DSA_MICROCHIP_KSZ8795_SPI
 
 	  It is required to use the KSZ8795 switch driver as the only access
 	  is through SPI.
+
+config NET_DSA_MICROCHIP_KSZ8863_SMI
+	tristate "KSZ series SMI connected switch driver"
+	depends on NET_DSA_MICROCHIP_KSZ8795
+	select MDIO_BITBANG
+	default y
+	help
+	  Select to enable support for registering switches configured through
+	  Microchip SMI. It Supports the KSZ8863 and KSZ8873 Switch.
+
+config NET_DSA_MICROCHIP_KSZ8863_UART
+	tristate "KSZ series UART connected switch driver"
+	depends on NET_DSA_MICROCHIP_KSZ8795
+	help
+	  Select to enable support for registering switches configured through
+	  UART. It Supports the KSZ8863 and KSZ8873 Switch.
+
+config NET_DSA_MICROCHIP_KSZ8863_PCP
+	tristate "KSZ series PCP connected switch driver"
+	depends on NET_DSA_MICROCHIP_KSZ8795
+	help
+	  Select to enable support for registering switches configured through
+	  PCP. It Supports the KSZ8863 and KSZ8873 Switch.

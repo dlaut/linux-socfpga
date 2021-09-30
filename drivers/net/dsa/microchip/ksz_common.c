@@ -193,6 +193,52 @@ void ksz_get_ethtool_stats(struct dsa_switch *ds, int port, uint64_t *buf)
 }
 EXPORT_SYMBOL_GPL(ksz_get_ethtool_stats);
 
+int ksz_get_ts_info(struct dsa_switch *ds, int port,
+		    struct ethtool_ts_info *ts)
+{
+	const struct dsa_port *dsaport = dsa_to_port(ds, port);
+	struct net_device *master = dsaport->cpu_dp->master;
+	const struct ethtool_ops *ops = master->ethtool_ops;
+	struct phy_device *phydev = master->phydev;
+
+	if (phydev && phydev->drv && phydev->drv->ts_info) {
+		 return phydev->drv->ts_info(phydev, ts);
+	} else if (ops->get_ts_info) {
+		return ops->get_ts_info(master, ts);
+	} else {
+		return ethtool_op_get_ts_info(dsaport->slave, ts);
+	}
+}
+EXPORT_SYMBOL_GPL(ksz_get_ts_info);
+
+static int ksz_port_do_hwstamp_ioctl(struct dsa_switch *ds, int port,
+				     struct ifreq *ifr, int cmd)
+{
+	struct net_device *master = dsa_to_port(ds, port)->cpu_dp->master;
+	const struct net_device_ops *ops = master->netdev_ops;
+	int res = -EOPNOTSUPP;
+
+	if (netif_device_present(master) && ops->ndo_do_ioctl)
+		res = ops->ndo_do_ioctl(master, ifr, cmd);
+	return res;
+}
+
+int ksz_port_hwtstamp_get(struct dsa_switch *ds, int port,
+			  struct ifreq *ifr)
+{
+	return ksz_port_do_hwstamp_ioctl(ds, port, ifr, SIOCGHWTSTAMP);
+}
+EXPORT_SYMBOL_GPL(ksz_port_hwtstamp_get);
+
+int ksz_port_hwtstamp_set(struct dsa_switch *ds, int port,
+			  struct ifreq *ifr)
+{
+	if (!net_eq(dev_net(dsa_to_port(ds, port)->cpu_dp->master), &init_net))
+		return -EOPNOTSUPP;
+	return ksz_port_do_hwstamp_ioctl(ds, port, ifr, SIOCSHWTSTAMP);
+}
+EXPORT_SYMBOL_GPL(ksz_port_hwtstamp_set);
+
 int ksz_port_bridge_join(struct dsa_switch *ds, int port,
 			 struct net_device *br)
 {
