@@ -15,6 +15,7 @@
 #include <linux/printk.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/firmware.h>
 
 #include "ksz8.h"
 #include "ksz_common.h"
@@ -35,13 +36,19 @@
 
 /* Messages ******************************************************************/
 #define KSZ8863_ISC_ENABLE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x74, 0x8, 0, 0}
+#define KSZ8863_LSC_INIT_ADDRESS_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x46, 0, 0, 0}
 #define KSZ8863_LSC_INIT_ADDR_NVCM1_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x47, 0, 0, 0}
 #define KSZ8863_LSC_READ_TAG_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xCA, 0, 0, 0x1}
+#define KSZ8863_LSC_READ_INCR_NV_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x73, 0x10, 0, 0}
 #define KSZ8863_ISC_DISABLE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x26, 0, 0}
+#define KSZ8863_ISC_PROGRAM_DONE_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x5E, 0, 0, 0}
 #define KSZ8863_NOOP_MESSAGE			{KSZ8863_FLASH_RW_COMMAND, 0xFF}
 #define KSZ8863_ISC_ERASE_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x0E, 0x08, 0x00, 0x00}
+#define KSZ8863_ISC_ERASE_CFG_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x0E, 0x04, 0x00, 0x00}
 #define KSZ8863_LSC_CHECK_BUSY_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xF0, 0x00, 0x00, 0x00}
 #define KSZ8863_LSC_PROG_TAG_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0xC9, 0x00, 0x00, 0x01}
+#define KSZ8863_LSC_PROG_INCR_NV_MESSAGE	{KSZ8863_FLASH_RW_COMMAND, 0x70, 0x00, 0x00, 0x00}
+#define KSZ8863_LSC_REFRESH_MESSAGE		{KSZ8863_FLASH_RW_COMMAND, 0x79, 0, 0}
 
 /* Serial Number *************************************************************/
 #define KSZ8863_SN_LENGTH		9
@@ -54,6 +61,9 @@
 #define KSZ8863_SEND_RETRIES		3
 #define KSZ8863_DETECT_RETRIES		6
 #define KSZ8863_CHECK_BUSY_RETRIES	20
+#define KSZ8863_CFG_FLASH_PAGE_MASK	GENMASK(3,0)
+#define KSZ8863_CFG_FLASH_PAGE_BYTES	KSZ8863_CFG_FLASH_PAGE_MASK + 1
+#define KSZ8863_FIRMWARE_FILENAME	"ebcfpga"
 
 
 /*****************************************************************************/
@@ -382,6 +392,59 @@ static const struct regmap_config ksz8863_regmap_pcp_config[] = {
 
 /* Sysfs functions ***********************************************************/
 
+/**
+ * Check if the CPLD is busy performing a time-consuming operation.
+ * NOTE: this function can sleep.
+ */
+static int ksz8863_pcp_check_cpld_busy(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc, bool *busy)
+{
+	const u8 message[] = KSZ8863_LSC_CHECK_BUSY_MESSAGE;
+	u8 rcv_buf[4];
+	int ret;
+
+	ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	if (ret)
+		return ret;
+	ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+	if (ret)
+		return ret;
+
+	*busy = rcv_buf[0] != 0;
+
+	if (*busy)
+		usleep_range(2000, 4000);
+
+	return 0;
+}
+
+/**
+ * Send disable then NOOP commands. This is usually done at the end of a flash access.
+ */
+static int ksz8863_pcp_disable_and_noop(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc)
+{
+	int ret;
+
+	// Disable
+	{
+		const u8 message[] = KSZ8863_ISC_DISABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		return ret;
+
+	usleep_range(100, 200);
+
+	// NOOP
+	{
+		const u8 message[] = KSZ8863_NOOP_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		return ret;
+
+	return 0;
+}
+
 ssize_t serial_number_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	ssize_t ret;
@@ -443,20 +506,8 @@ ssize_t serial_number_show(struct device *dev, struct device_attribute *attr, ch
 	}
 	serial_number[KSZ8863_SN_LENGTH] = '\0'; // Terminate string
 
-	// Disable
-	{
-		u8 message[] = KSZ8863_ISC_DISABLE_MESSAGE;
-		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
-	}
-	if (ret)
-		goto ldisc_deref;
-
-	// NOOP
-	{
-		u8 message[] = KSZ8863_NOOP_MESSAGE;
-		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
-	}
-	if (ret)
+	ret = ksz8863_pcp_disable_and_noop(pcp, ldisc);
+	if (unlikely(ret))
 		goto ldisc_deref;
 
 	ret = snprintf(buf, PAGE_SIZE, "%s\n", serial_number);
@@ -524,21 +575,12 @@ ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
 
 	// Check busy until it is ready
 	{
-		const u8 message[] = KSZ8863_LSC_CHECK_BUSY_MESSAGE;
-		u8 rcv_buf[4];
 		bool busy;
 		do
 		{
-			ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+			ret = ksz8863_pcp_check_cpld_busy(pcp, ldisc, &busy);
 			if (ret)
 				goto ldisc_deref;
-			ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
-			if (ret)
-				goto ldisc_deref;
-
-			busy = rcv_buf[0] != 0;
-
-			usleep_range(2000, 4000);
 		} while (busy);
 	}
 
@@ -556,7 +598,6 @@ ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
 	for (i = 0; i < KSZ8863_SN_N_PAGES; ++i)
 	{
 		u8 prog_message[21] = KSZ8863_LSC_PROG_TAG_MESSAGE;
-		const u8 check_busy_message[] = KSZ8863_LSC_CHECK_BUSY_MESSAGE;
 		u8 rcv_buf[4];
 		int j;
 		bool busy;
@@ -576,16 +617,9 @@ ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
 		// Check busy for several times. If not ready, abort.
 		for (j = 0, busy = true; j < KSZ8863_CHECK_BUSY_RETRIES && busy; ++j)
 		{
-			ret = ksz8863_pcp_do_write(pcp, ldisc, check_busy_message, ARRAY_SIZE(check_busy_message));
+			ret = ksz8863_pcp_check_cpld_busy(pcp, ldisc, &busy);
 			if (ret)
 				goto ldisc_deref;
-			ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
-			if (ret)
-				goto ldisc_deref;
-
-			busy = rcv_buf[0] != 0;
-
-			usleep_range(2000, 4000);
 		}
 		if (busy)
 		{
@@ -621,6 +655,7 @@ ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
 		if (memcmp(rcv_buf, buf + (i*KSZ8863_SN_BYTES_PER_PAGE), KSZ8863_SN_BYTES_PER_PAGE) != 0)
 		{
 			dev_err(pcp->dev, "%s: Stored serial number verification failed.", __FUNCTION__);
+			ksz8863_pcp_disable_and_noop(pcp, ldisc);
 			ret = -EIO;
 			goto ldisc_deref;
 		}
@@ -628,22 +663,8 @@ ssize_t serial_number_store(struct device *dev, struct device_attribute *attr,
 		usleep_range(200, 500);
 	}
 
-	// Disable
-	{
-		u8 message[] = KSZ8863_ISC_DISABLE_MESSAGE;
-		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
-	}
-	if (ret)
-		goto ldisc_deref;
-
-	usleep_range(100, 200);
-
-	// NOOP
-	{
-		u8 message[] = KSZ8863_NOOP_MESSAGE;
-		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
-	}
-	if (ret)
+	ret = ksz8863_pcp_disable_and_noop(pcp, ldisc);
+	if (unlikely(ret))
 		goto ldisc_deref;
 
 	// Success: return full write size even if we didn't consume all
@@ -684,9 +705,223 @@ ssize_t cpld_version_show(struct device *dev, struct device_attribute *attr, cha
 
 static DEVICE_ATTR_RO(cpld_version);
 
+ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	ssize_t ret;
+	bool input;
+	unsigned n_pages;
+	const unsigned flash_page_bytes = KSZ8863_CFG_FLASH_PAGE_BYTES;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
+	struct tty_ldisc *ldisc;
+	const struct firmware *fw_entry;
+
+	// Precondition: input value must be a "truthy" bool-like value
+	ret = strtobool(buf, &input);
+	if (unlikely(ret))
+	{
+		dev_err(pcp->dev, "%s: Invalid parameter: %s", __FUNCTION__, buf);
+		return ret;
+	}
+	if (unlikely(!input))
+	{
+		dev_info(pcp->dev, "%s: Nothing to do... Write a 'truthy' value to trigger the update", __FUNCTION__);
+		return len;
+	}
+
+	// Retrieve firmware file
+	ret = request_firmware(&fw_entry, KSZ8863_FIRMWARE_FILENAME, pcp->dev);
+	if(unlikely(ret))
+	{
+		dev_err(pcp->dev, "%s: Unable to load firmware file " KSZ8863_FIRMWARE_FILENAME, __FUNCTION__);
+		return ret;
+	}
+
+	// Check firmware contents: firmware size must be multiple of flash page size
+	if (unlikely(fw_entry->size & KSZ8863_CFG_FLASH_PAGE_MASK))
+	{
+		dev_err(pcp->dev, "%s: Firmware file size (%zu) is not multiple of flash page size (%u)", __FUNCTION__, fw_entry->size, flash_page_bytes);
+		ret = -EINVAL;
+		goto release_fw;
+	}
+
+	n_pages = fw_entry->size / flash_page_bytes;
+	dev_info(pcp->dev, "%s: Firmware file size: %zu. Pages to write: %u", __FUNCTION__, fw_entry->size, n_pages);
+
+	// Lock ldisc
+	ldisc = get_tty_ldisc(pcp);
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		ret = -ENODEV;
+		goto release_fw;
+	}
+
+	// Reset Wishbone Bus
+	{
+		const u8 message = KSZ8863_FLASH_RESET_COMMAND;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, &message, sizeof(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Enable configuration interface in transparent mode
+	{
+		const u8 message[] = KSZ8863_ISC_ENABLE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	usleep_range(100, 200);
+
+	// Erase CFG
+	{
+		const u8 message[] = KSZ8863_ISC_ERASE_CFG_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	// Sleep for a bit waiting for CFG erasure completion.
+	// NOTE: Keep the line discipline locked because data cannot
+	// be transfered during erasure procedure.
+	msleep(2000);
+
+	// Check busy until it is ready
+	{
+		bool busy;
+		do
+		{
+			ret = ksz8863_pcp_check_cpld_busy(pcp, ldisc, &busy);
+			if (ret)
+				goto ldisc_deref;
+		} while (busy);
+	}
+
+	// Init CFG Flash Address
+	{
+		const u8 message[] = KSZ8863_LSC_INIT_ADDRESS_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	// Write Flash AREA0 (Configuration Flash)
+	{
+		u8 message[21] = KSZ8863_LSC_PROG_INCR_NV_MESSAGE;
+		int i;
+
+		for (i = 0; i < n_pages; ++i)
+		{
+			int j;
+			bool busy;
+
+			// Fill firmware bytes
+			memcpy(message + 5, fw_entry->data + (i * flash_page_bytes), flash_page_bytes);
+
+			ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+			if (unlikely(ret))
+				goto ldisc_deref;
+
+			usleep_range(100, 200);
+
+			// Check busy for several times. If not ready, abort.
+			for (j = 0, busy = true; j < KSZ8863_CHECK_BUSY_RETRIES && busy; ++j)
+			{
+				ret = ksz8863_pcp_check_cpld_busy(pcp, ldisc, &busy);
+				if (unlikely(ret))
+					goto ldisc_deref;
+			}
+			if (unlikely(busy))
+			{
+				dev_err(pcp->dev, "%s: Stuck in busy condition. Abort.", __FUNCTION__);
+				ret = -EBUSY;
+				goto ldisc_deref;
+			}
+		}
+	}
+
+	dev_info(pcp->dev, "%s: Firmware write completed", __FUNCTION__);
+
+	// Init CFG Flash Address
+	{
+		const u8 message[] = KSZ8863_LSC_INIT_ADDRESS_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	// Verify Flash AREA0 (Configuration Flash)
+	{
+		int i;
+		u8 rcv_buf[flash_page_bytes];
+		const u8 message[] = KSZ8863_LSC_READ_INCR_NV_MESSAGE;
+
+		for (i = 0; i < n_pages; ++i)
+		{
+			ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+			if (unlikely(ret))
+				goto ldisc_deref;
+			ret = ksz8863_pcp_do_read(pcp, ldisc, rcv_buf, ARRAY_SIZE(rcv_buf));
+			if (unlikely(ret))
+				goto ldisc_deref;
+
+			// Compare with input firmware
+			if (memcmp(rcv_buf, fw_entry->data + (i * flash_page_bytes), flash_page_bytes) != 0)
+			{
+				dev_err(pcp->dev, "%s: Stored firmware verification failed on page %d.", __FUNCTION__, i);
+				ksz8863_pcp_disable_and_noop(pcp, ldisc);
+				ret = -EIO;
+				goto ldisc_deref;
+			}
+		}
+	}
+
+	dev_info(pcp->dev, "%s: Firmware verification completed", __FUNCTION__);
+
+	// Program done
+	{
+		const u8 message[] = KSZ8863_ISC_PROGRAM_DONE_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	usleep_range(200, 400);
+
+	ret = ksz8863_pcp_disable_and_noop(pcp, ldisc);
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	// Refresh
+	{
+		const u8 message[] = KSZ8863_LSC_REFRESH_MESSAGE;
+		ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
+	}
+	if (unlikely(ret))
+		goto ldisc_deref;
+
+	// Success: return full write size even if we didn't consume it all
+	ret = len;
+	dev_info(pcp->dev, "%s: Firmware update completed", __FUNCTION__);
+
+  ldisc_deref:
+	release_tty_ldisc(pcp, ldisc);
+  release_fw:
+	release_firmware(fw_entry);
+
+	return ret;
+}
+
+static DEVICE_ATTR_WO(trigger_cpld_update);
+
 static struct attribute *ksz8863_attrs[] = {
 	&dev_attr_serial_number.attr,
 	&dev_attr_cpld_version.attr,
+	&dev_attr_trigger_cpld_update.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ksz8863);
