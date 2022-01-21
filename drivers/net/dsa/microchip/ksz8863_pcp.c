@@ -64,6 +64,8 @@
 #define KSZ8863_CFG_FLASH_PAGE_MASK	GENMASK(3,0)
 #define KSZ8863_CFG_FLASH_PAGE_BYTES	(KSZ8863_CFG_FLASH_PAGE_MASK + 1)
 #define KSZ8863_FIRMWARE_FILENAME	"ebcfpga"
+#define KSZ8863_FIRST_MAJOR_WITH_HB	6
+#define KSZ8863_HB_TIMEOUT_TIME_MS	2000
 
 
 /*****************************************************************************/
@@ -72,9 +74,11 @@
 
 struct ksz8863_pcp
 {
-	struct device           *dev;	// Associated device
-	struct tty_struct	*tty;	// TTY used for PCP communication
-	struct mutex 		lock;	// Lock for TTY line discipline
+	struct device           *dev;		// Associated device
+	struct tty_struct	*tty;		// TTY used for PCP communication
+	struct mutex 		lock;		// Lock for TTY line discipline
+	struct timer_list	hb_timer;	// Timer used to toggle reset GPIO (heartbeat)
+	struct gpio_desc	*alive_gpio;	// pointer to alive GPIO descriptor (devm managed)
 };
 
 
@@ -88,6 +92,10 @@ static const u8 autodetection_message[] = {0xC1, 0xA0, 0xEB, 0xC0};
 /*****************************************************************************/
 /*                                 Functions                                 */
 /*****************************************************************************/
+
+/* Forward declarations ******************************************************/
+static int ksz8863_pcp_send_command(struct ksz8863_pcp *pcp, struct tty_ldisc *ldisc,
+				    u8 *cmd, size_t count);
 
 /* Utility functions *********************************************************/
 
@@ -142,6 +150,41 @@ static struct ksz8863_pcp* to_ksz8863_pcp_struct(struct ksz_device *ksz_dev)
 	return (struct ksz8863_pcp*)((struct ksz8*)ksz_dev->priv)->priv;
 }
 
+/**
+ * Ask for CPLD version
+ */
+static int get_cpld_versions(struct device *dev, u8* major, u8* minor, u8* fix)
+{
+	ssize_t ret;
+	u8 message[] = {KSZ8863_QUERY_VERSION_COMMAND, 0, 0, 0};
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
+	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
+
+	if (unlikely(!ldisc))
+	{
+		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	ret = ksz8863_pcp_send_command(pcp, ldisc, message, ARRAY_SIZE(message));
+
+	if (ret)
+	{
+		*major = 0;
+		*minor = 0;
+		*fix = 0;
+	}
+	else
+	{
+		*major = message[1];
+		*minor = message[2];
+		*fix = message[3];
+	}
+
+	release_tty_ldisc(pcp, ldisc);
+
+	return ret;
+}
 
 /* Regmap functions **********************************************************/
 
@@ -680,27 +723,15 @@ static DEVICE_ATTR_RW(serial_number);
 
 ssize_t cpld_version_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	ssize_t ret;
-	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
-	u8 message[] = {KSZ8863_QUERY_VERSION_COMMAND, 0, 0, 0};
-	struct tty_ldisc *ldisc = get_tty_ldisc(pcp);
+	u8 major, minor, fix;
 
-	if (unlikely(!ldisc))
+	if (get_cpld_versions(dev, &major, &minor, &fix))
 	{
-		dev_err(pcp->dev, "%s: Unable to lock ldisc", __FUNCTION__);
+		dev_err(dev, "%s: Unable get cpl version", __FUNCTION__);
 		return -ENODEV;
 	}
 
-	ret = ksz8863_pcp_send_command(pcp, ldisc, message, ARRAY_SIZE(message));
-	if (ret)
-		goto ldisc_deref;
-
-	ret = snprintf(buf, PAGE_SIZE, "%d.%d.%d\n", message[1], message[2], message[3]);
-
-  ldisc_deref:
-	release_tty_ldisc(pcp, ldisc);
-
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%d.%d.%d\n", major, minor, fix);
 }
 
 static DEVICE_ATTR_RO(cpld_version);
@@ -711,7 +742,6 @@ ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *a
 	ssize_t ret;
 	bool input;
 	unsigned n_pages;
-	const unsigned flash_page_bytes = KSZ8863_CFG_FLASH_PAGE_BYTES;
 	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(dev_get_drvdata(dev));
 	struct tty_ldisc *ldisc;
 	const struct firmware *fw_entry;
@@ -740,12 +770,12 @@ ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *a
 	// Check firmware contents: firmware size must be multiple of flash page size
 	if (unlikely(fw_entry->size & KSZ8863_CFG_FLASH_PAGE_MASK))
 	{
-		dev_err(pcp->dev, "%s: Firmware file size (%zu) is not multiple of flash page size (%u)", __FUNCTION__, fw_entry->size, flash_page_bytes);
+		dev_err(pcp->dev, "%s: Firmware file size (%zu) is not multiple of flash page size (%lu)", __FUNCTION__, fw_entry->size, KSZ8863_CFG_FLASH_PAGE_BYTES);
 		ret = -EINVAL;
 		goto release_fw;
 	}
 
-	n_pages = fw_entry->size / flash_page_bytes;
+	n_pages = fw_entry->size / KSZ8863_CFG_FLASH_PAGE_BYTES;
 	dev_info(pcp->dev, "%s: Firmware file size: %zu. Pages to write: %u", __FUNCTION__, fw_entry->size, n_pages);
 
 	// Lock ldisc
@@ -820,7 +850,7 @@ ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *a
 			bool busy;
 
 			// Fill firmware bytes
-			memcpy(message + 5, fw_entry->data + (i * flash_page_bytes), flash_page_bytes);
+			memcpy(message + 5, fw_entry->data + (i * KSZ8863_CFG_FLASH_PAGE_BYTES), KSZ8863_CFG_FLASH_PAGE_BYTES);
 
 			ret = ksz8863_pcp_do_write(pcp, ldisc, message, ARRAY_SIZE(message));
 			if (unlikely(ret))
@@ -857,7 +887,7 @@ ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *a
 	// Verify Flash AREA0 (Configuration Flash)
 	{
 		int i;
-		u8 rcv_buf[flash_page_bytes];
+		u8 rcv_buf[KSZ8863_CFG_FLASH_PAGE_BYTES];
 		const u8 message[] = KSZ8863_LSC_READ_INCR_NV_MESSAGE;
 
 		for (i = 0; i < n_pages; ++i)
@@ -870,7 +900,7 @@ ssize_t trigger_cpld_update_store(struct device *dev, struct device_attribute *a
 				goto ldisc_deref;
 
 			// Compare with input firmware
-			if (memcmp(rcv_buf, fw_entry->data + (i * flash_page_bytes), flash_page_bytes) != 0)
+			if (memcmp(rcv_buf, fw_entry->data + (i * KSZ8863_CFG_FLASH_PAGE_BYTES), KSZ8863_CFG_FLASH_PAGE_BYTES) != 0)
 			{
 				dev_err(pcp->dev, "%s: Stored firmware verification failed on page %d.", __FUNCTION__, i);
 				ksz8863_pcp_disable_and_noop(pcp, ldisc);
@@ -1164,7 +1194,7 @@ static void ksz8863_pcp_reset_gpio(void *ptr)
 /**
  * Get an output GPIO and set its value to 1. Reset its value on exit.
  */
-static int ksz8863_pcp_init_gpio(struct device *dev, const char *gpio_name)
+static int ksz8863_pcp_init_gpio(struct device *dev, const char *gpio_name, struct gpio_desc **gpio_desc_field)
 {
 	struct gpio_desc *gpio = devm_gpiod_get(dev, gpio_name, GPIOD_OUT_HIGH);
 	int err;
@@ -1173,6 +1203,11 @@ static int ksz8863_pcp_init_gpio(struct device *dev, const char *gpio_name)
 	{
 		dev_err(dev, "%s: Failed to retrieve %s GPIO", __FUNCTION__, gpio_name);
 		return PTR_ERR(gpio);
+	}
+
+	if (gpio_desc_field)
+	{
+		*gpio_desc_field = gpio;
 	}
 
 	// Register cleanup function for managed resource unwinding
@@ -1186,15 +1221,16 @@ static int ksz8863_pcp_init_gpio(struct device *dev, const char *gpio_name)
 /**
  * Get all GPIO references and set them
  */
-static int ksz8863_pcp_init_gpios(struct platform_device *op)
+static int ksz8863_pcp_init_gpios(struct ksz_device *ksz_dev)
 {
-	struct device *pdev = &op->dev;
 	int ret;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
+	struct device *pdev = pcp->dev;
 
-	ret = ksz8863_pcp_init_gpio(pdev, "alive");
+	ret = ksz8863_pcp_init_gpio(pdev, "alive", &pcp->alive_gpio);
 	if (unlikely(ret))
 		return ret;
-	ret = ksz8863_pcp_init_gpio(pdev, "comm-enable");
+	ret = ksz8863_pcp_init_gpio(pdev, "comm-enable", NULL);
 	if (unlikely(ret))
 		return ret;
 
@@ -1280,6 +1316,87 @@ static int __init ksz8863_pcp_init_sysfs(struct ksz_device *ksz_dev)
 	return ret;
 }
 
+/**
+ * Heartbeat timer callback
+ */
+static void ksz8863_pcp_hb_timeout(struct timer_list *t)
+{
+	int val;
+	struct ksz8863_pcp *pcp = from_timer(pcp, t, hb_timer);
+	struct gpio_desc *gpio = pcp->alive_gpio;
+
+	/* Get current GPIO value */
+	val = gpiod_get_value(gpio);
+	if (val < 0)
+	{
+		/* only show error here. in at least 5 seconds we are fu**ed! */
+		dev_err(pcp->dev, "%s: Unable get gpio value. good luck!", __FUNCTION__);
+	}
+	else
+	{
+		/* Toggle the GPIO value. This is our heartbeat. */
+		gpiod_set_value(gpio, !!!val);
+	}
+
+	/* reschedule timer */
+	mod_timer(&pcp->hb_timer, jiffies + msecs_to_jiffies(KSZ8863_HB_TIMEOUT_TIME_MS));
+}
+
+/**
+ * Stop heartbeat timer. Used as devm action.
+ */
+static void ksz8863_pcp_stop_hb_timer(void *ptr)
+{
+	struct timer_list *timer = ptr;
+	del_timer_sync(timer);
+}
+
+/**
+ * Check CPLD version and start timer that will toggle reset GPIO (if needed).
+ * This mechanism is used as a sort of heartbeat signal for EBC box FPGA.
+ */
+static int __init ksz8863_pcp_init_heartbeat(struct ksz_device *ksz_dev)
+{
+	u8 major, minor, fix;
+	int ret;
+	struct ksz8863_pcp *pcp = to_ksz8863_pcp_struct(ksz_dev);
+	struct device *dev = pcp->dev;
+
+	if (get_cpld_versions(dev, &major, &minor, &fix))
+	{
+		dev_err(dev, "%s: Unable get cpl version", __FUNCTION__);
+		return -ENODEV;
+	}
+	dev_info(dev, "EBC box CPLD version: %u.%u.%u", major, minor, fix);
+
+	if (major < KSZ8863_FIRST_MAJOR_WITH_HB)
+	{
+		/*
+		 * If we have an old CPLD version, do not start the timer
+		 * (it will cause a FPGA reset and a reboot!).
+		 * We need to deal this scenario for the CPLD update.
+		 */
+		dev_dbg(dev, "Old CPLD detected! Do not start reset timer.");
+		return 0;
+	}
+
+	/* Register devm action to stop timer on driver close */
+	ret = devm_add_action_or_reset(dev, ksz8863_pcp_stop_hb_timer, &pcp->hb_timer);
+	if (unlikely(ret))
+	{
+		dev_err(dev, "(%s) Unable to add timer close action", __FUNCTION__);
+		return ret;
+	}
+
+	/* Setup timer for HB */
+	timer_setup(&pcp->hb_timer, ksz8863_pcp_hb_timeout, 0);
+	/* And start the timer the first time 100 milliseconds later. */
+	pcp->hb_timer.expires = jiffies + msecs_to_jiffies(100);
+	add_timer(&pcp->hb_timer);
+
+	return 0;
+}
+
 static int __init ksz8863_pcp_probe(struct platform_device *op)
 {
 	struct device *pdev = &op->dev;
@@ -1306,7 +1423,7 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 	if (unlikely(ret))
 		return ret;
 
-	ret = ksz8863_pcp_init_gpios(op);
+	ret = ksz8863_pcp_init_gpios(ksz_dev);
 	if (unlikely(ret))
 		return ret;
 
@@ -1314,9 +1431,24 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 	if (unlikely(ret))
 		return ret;
 
+	/*
+	 * If we have a CPLD version greater than 5.x.y,
+	 * we have 5 seconds from now to toggle reset GPIO,
+	 * else FPGA will reset, starting sending again autodetection message.
+	 */
+
 	ret = ksz8863_pcp_reset_cpld(ksz_dev);
 	if (unlikely(ret))
 		return ret;
+
+	ret = ksz8863_pcp_init_heartbeat(ksz_dev);
+	if (unlikely(ret))
+		return ret;
+
+	/*
+	 * Now, in 100 ms the timer will start doing is dirty job:
+	 * moving GPIO and avoiding FPGA resetting.
+	 */
 
 	ret = ksz8863_pcp_dummy_read(ksz_dev);
 	if (unlikely(ret))
