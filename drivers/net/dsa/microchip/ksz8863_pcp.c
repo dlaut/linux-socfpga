@@ -57,12 +57,12 @@
 #define KSZ8863_FLASH_PAGE_BYTES	4
 
 /* Other *********************************************************************/
-#define KSZ8863_COMMAND_HEADER_SIZE	sizeof(u8) + sizeof(u8)	// command + reg address
+#define KSZ8863_COMMAND_HEADER_SIZE	(sizeof(u8) + sizeof(u8))	// command + reg address
 #define KSZ8863_SEND_RETRIES		3
 #define KSZ8863_DETECT_RETRIES		6
 #define KSZ8863_CHECK_BUSY_RETRIES	20
 #define KSZ8863_CFG_FLASH_PAGE_MASK	GENMASK(3,0)
-#define KSZ8863_CFG_FLASH_PAGE_BYTES	KSZ8863_CFG_FLASH_PAGE_MASK + 1
+#define KSZ8863_CFG_FLASH_PAGE_BYTES	(KSZ8863_CFG_FLASH_PAGE_MASK + 1)
 #define KSZ8863_FIRMWARE_FILENAME	"ebcfpga"
 
 
