@@ -1155,6 +1155,13 @@ static int ksz8863_pcp_detect_ebc(struct ksz_device *ksz_dev)
 		return -ENOMEM;
 	}
 
+	/*
+	 * We sadly need to sleep here to be sure that the EBC box is resetted.
+	 * Note that EBC box reset itself after 2.5 seconds without changes
+	 * on reset GPIO.
+	 */
+	msleep(2750);
+
 	// Read several times from TTY searching for autodetection msg
 	for (n_retries = 0; n_retries < KSZ8863_DETECT_RETRIES; ++n_retries)
 	{
@@ -1329,7 +1336,7 @@ static void ksz8863_pcp_hb_timeout(struct timer_list *t)
 	val = gpiod_get_value(gpio);
 	if (val < 0)
 	{
-		/* only show error here. in at least 5 seconds we are fu**ed! */
+		/* only show error here. in at least 2.5 seconds we are fu**ed! */
 		dev_err(pcp->dev, "%s: Unable get gpio value. good luck!", __FUNCTION__);
 	}
 	else
@@ -1433,7 +1440,7 @@ static int __init ksz8863_pcp_probe(struct platform_device *op)
 
 	/*
 	 * If we have a CPLD version greater than 5.x.y,
-	 * we have 5 seconds from now to toggle reset GPIO,
+	 * we have 2.5 seconds from now to toggle reset GPIO,
 	 * else FPGA will reset, starting sending again autodetection message.
 	 */
 
